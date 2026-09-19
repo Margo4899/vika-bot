@@ -1,5 +1,6 @@
 import os
 import re
+import random
 import requests
 from flask import Flask, request
 import vk_api
@@ -8,13 +9,13 @@ from phrases import NAMES_PATTERN
 
 app = Flask(__name__)
 
-# Берём ключи из переменных Render (поддерживаем и AI_API_KEY, и GROQ_API_KEY)
+# Чтение ключей
 VK_TOKEN = os.environ.get('VK_TOKEN', '')
 CONFIRMATION_CODE = os.environ.get('CONFIRMATION_CODE') or os.environ.get('CONFIRMATION_TOKEN', '')
 AI_API_KEY = os.environ.get('AI_API_KEY') or os.environ.get('GROQ_API_KEY', '')
 
-# Актуальные модели Groq: 'llama-3.3-70b-versatile' или 'llama-3.1-8b-instant'
-AI_MODEL = 'llama-3.3-70b-versatile'
+# Использование гарантированно доступной модели в бесплатном API Groq
+AI_MODEL = 'llama-3.1-8b-instant'
 AI_URL = 'https://api.groq.com/openai/v1/chat/completions'
 
 vk = vk_api.VkApi(token=VK_TOKEN) if VK_TOKEN else None
@@ -34,7 +35,7 @@ def send_message(peer_id, text):
 
 def analyze_and_generate_response(text):
     if not AI_API_KEY:
-        print("ОШИБКА: Ключ API не найден в переменных окружения!")
+        print("ОШИБКА: Ключ API не найден в переменной окружения!")
         return False, None, None
 
     prompt = (
