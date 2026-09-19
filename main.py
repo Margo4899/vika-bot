@@ -13,7 +13,7 @@ VK_TOKEN = os.environ.get('VK_TOKEN', '')
 CONFIRMATION_CODE = os.environ.get('CONFIRMATION_CODE') or os.environ.get('CONFIRMATION_TOKEN', '')
 AI_API_KEY = os.environ.get('AI_API_KEY') or os.environ.get('GROQ_API_KEY', '')
 
-# Актуальный список моделей Groq
+# Актуальные модели Groq
 AI_MODELS = [
     'openai/gpt-oss-120b',
     'openai/gpt-oss-20b',
@@ -24,6 +24,7 @@ AI_URL = 'https://api.groq.com/openai/v1/chat/completions'
 
 vk = vk_api.VkApi(token=VK_TOKEN) if VK_TOKEN else None
 stats = {}
+user_names_cache = {}  # Кэш для имён, чтобы не спамить запросами к ВК
 
 def send_message(peer_id, text):
     if vk:
@@ -37,6 +38,26 @@ def send_message(peer_id, text):
         except Exception as e:
             print("ОШИБКА ВК API:", e)
 
+def get_user_name(user_id):
+    """Получает имя и фамилию пользователя по его ID"""
+    if user_id in user_names_cache:
+        return user_names_cache[user_id]
+    
+    if vk:
+        try:
+            res = vk.method('users.get', {'user_ids': user_id})
+            if res and len(res) > 0:
+                first_name = res[0].get('first_name', '')
+                last_name = res[0].get('last_name', '')
+                full_name = f"{first_name} {last_name}".strip()
+                if full_name:
+                    user_names_cache[user_id] = full_name
+                    return full_name
+        except Exception as e:
+            print(f"Ошибка получения имени для id{user_id}:", e)
+            
+    return "Участник"
+
 def analyze_and_generate_response(text):
     if not AI_API_KEY:
         print("ОШИБКА: Ключ API не найден в переменных окружения!")
@@ -47,7 +68,7 @@ def analyze_and_generate_response(text):
         "Твоя задача:\n"
         "1. Определи, адресован ли тут подкол, хамство, сарказм, ирония или наезд на девушку по имени Вика, Ксюша или Рита (или их формы/опечатки).\n"
         "2. Если наезда/хамства НЕТ или имя не относится к этой троице, ответь строго одним словом: НОРМА.\n"
-        "3. Если наезд/хамство ЕСТЬ, ответь строго в таком формате без лишних слов:\n"
+        "3. Если наезд/хамство ЕСТЬ, ответь строго в таком формате без лишних слов и рассуждений:\n"
         "ТОКСИК | [Имя девушки в винительном падеже (Вику / Ксюшу / Риту)] | [Короткий, смешной и ироничный комментарий бота]\n\n"
         "Пример ответа при хамстве на Вику:\n"
         "ТОКСИК | Вику | 🚨 Обнаружена попытка задеть Вику! Наш виртуальный щит уже активирован."
@@ -58,7 +79,6 @@ def analyze_and_generate_response(text):
         "Content-Type": "application/json"
     }
 
-    # Автоматический перебор действующих моделей
     for model_name in AI_MODELS:
         payload = {
             "model": model_name,
@@ -76,11 +96,13 @@ def analyze_and_generate_response(text):
 
             print(f"УСПЕХ НА МОДЕЛИ [{model_name}]:", result)
             if 'choices' in result and len(result['choices']) > 0:
-                answer = result['choices'][0]['message']['content'].strip()
-                print("ОТВЕТ ИИ:", answer)
+                full_content = result['choices'][0]['message']['content'].strip()
                 
-                if "ТОКСИК" in answer.upper():
-                    parts = answer.split("|")
+                if "ТОКСИК" in full_content.upper():
+                    toxic_index = full_content.upper().find("ТОКСИК")
+                    clean_answer = full_content[toxic_index:].strip()
+                    
+                    parts = clean_answer.split("|")
                     if len(parts) >= 3:
                         target_name = parts[1].strip()
                         ai_comment = parts[2].strip()
@@ -118,7 +140,7 @@ def bot():
         peer_id = message.get('peer_id')
         from_id = message.get('from_id')
         
-        if not peer_id:
+        if not peer_id or not from_id:
             return 'ok'
 
         if peer_id not in stats:
@@ -129,9 +151,10 @@ def bot():
                 send_message(peer_id, "📊 Пока никто не подкалывал девчонок!")
             else:
                 sorted_users = sorted(stats[peer_id].items(), key=lambda x: x[1], reverse=True)
-                top_text = "🏆 **ТОП самых острых на язык в беседе:**\n\n"
+                top_text = "🏆 ТОП самых острых на язык в беседе:\n\n"
                 for i, (u_id, count) in enumerate(sorted_users[:10], 1):
-                    top_text += f"{i}. [id{u_id}|Участник] — {count} замеченных наездов\n"
+                    user_name = get_user_name(u_id)
+                    top_text += f"{i}. [id{u_id}|{user_name}] — {count} замеченных наездов\n"
                 send_message(peer_id, top_text)
             return 'ok'
 
@@ -143,14 +166,16 @@ def bot():
                 stats[peer_id][from_id] = stats[peer_id].get(from_id, 0) + 1
                 user_count = stats[peer_id][from_id]
                 
+                user_name = get_user_name(from_id)
+                
                 reply = (
                     f"{ai_comment}\n\n"
-                    f"🛡️ **Защита:** [id{from_id}|Участник], зафиксирован наезд на **{target_name}**!\n"
-                    f"📈 Ваша статистика в банке токсичности: **{user_count}**"
+                    f"🛡️ Защита: [id{from_id}|{user_name}], зафиксирован наезд на {target_name}!\n"
+                    f"📈 Ваша статистика в банке токсичности: {user_count}"
                 )
                 send_message(peer_id, reply)
             else:
-                print("ИИ счёл сообщение безопасным или все модели ответили ошибкой.")
+                print("ИИ счёл сообщение безопасным или произошла ошибка.")
             
         return 'ok'
 
