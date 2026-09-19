@@ -15,7 +15,7 @@ CONFIRMATION_CODE = os.environ.get('CONFIRMATION_CODE') or os.environ.get('CONFI
 AI_API_KEY = os.environ.get('AI_API_KEY') or os.environ.get('GROQ_API_KEY', '')
 
 # Использование гарантированно доступной модели в бесплатном API Groq
-AI_MODEL = 'llama-3.1-8b-instant'
+AI_MODEL = 'llama3-70b-8192'
 AI_URL = 'https://api.groq.com/openai/v1/chat/completions'
 
 vk = vk_api.VkApi(token=VK_TOKEN) if VK_TOKEN else None
