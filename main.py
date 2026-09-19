@@ -8,19 +8,17 @@ from phrases import NAMES_PATTERN
 
 app = Flask(__name__)
 
-# Получение переменных окружения (поддержка разных названий ключей)
+# Получение переменных окружения
 VK_TOKEN = os.environ.get('VK_TOKEN', '')
 CONFIRMATION_CODE = os.environ.get('CONFIRMATION_CODE') or os.environ.get('CONFIRMATION_TOKEN', '')
 AI_API_KEY = os.environ.get('AI_API_KEY') or os.environ.get('GROQ_API_KEY', '')
 
-# Полный перечень всех доступных моделей Groq (от быстрых к мощным)
+# Актуальный список моделей Groq
 AI_MODELS = [
-    'llama-3.3-70b-versatile',
-    'llama-3.1-8b-instant',
-    'llama-3.2-3b-preview',
-    'llama-3.2-1b-preview',
-    'mixtral-8x7b-32768',
-    'gemma2-9b-it'
+    'openai/gpt-oss-120b',
+    'openai/gpt-oss-20b',
+    'qwen/qwen3.8-27b',
+    'qwen/qwen3.6-27b'
 ]
 AI_URL = 'https://api.groq.com/openai/v1/chat/completions'
 
@@ -60,7 +58,7 @@ def analyze_and_generate_response(text):
         "Content-Type": "application/json"
     }
 
-    # Автоматический перебор моделей при ошибках или депрекации
+    # Автоматический перебор действующих моделей
     for model_name in AI_MODELS:
         payload = {
             "model": model_name,
@@ -93,7 +91,7 @@ def analyze_and_generate_response(text):
             print(f"Исключение при вызове {model_name}:", e)
             continue
 
-    print("ОШИБКА: Ни одна из резервных моделей Groq не ответила.")
+    print("ОШИБКА: Ни одна из моделей не ответила.")
     return False, None, None
 
 @app.route('/', methods=['GET', 'POST'])
@@ -126,7 +124,6 @@ def bot():
         if peer_id not in stats:
             stats[peer_id] = {}
 
-        # Команды рейтинга
         if '!топ' in text.lower() or '!рейтинг' in text.lower():
             if not stats[peer_id]:
                 send_message(peer_id, "📊 Пока никто не подкалывал девчонок!")
@@ -138,7 +135,6 @@ def bot():
                 send_message(peer_id, top_text)
             return 'ok'
 
-        # Фильтр по именам
         if NAMES_PATTERN.search(text):
             print(f"Имя распознано в сообщении: '{text}'")
             is_toxic, target_name, ai_comment = analyze_and_generate_response(text)
