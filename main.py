@@ -8,7 +8,6 @@ from phrases import NAMES_PATTERN
 
 app = Flask(__name__)
 
-# Переменные окружения из Render
 VK_TOKEN = os.environ.get('VK_TOKEN', '')
 CONFIRMATION_CODE = os.environ.get('CONFIRMATION_CODE', '')
 AI_API_KEY = os.environ.get('AI_API_KEY', '')
@@ -16,14 +15,10 @@ AI_API_KEY = os.environ.get('AI_API_KEY', '')
 AI_URL = 'https://api.groq.com/openai/v1/chat/completions'
 AI_MODEL = 'llama-3.3-70b-versatile'
 
-# Инициализация ВК API
 vk = vk_api.VkApi(token=VK_TOKEN) if VK_TOKEN else None
-
-# Локальное хранилище статистики токсичности по чатам
 stats = {}
 
 def send_message(peer_id, text):
-    """Отправка сообщения в ВК чат"""
     if vk:
         try:
             vk.method('messages.send', {
@@ -31,11 +26,11 @@ def send_message(peer_id, text):
                 'message': text,
                 'random_id': 0
             })
+            print(f"УСПЕШНО ОТПРАВЛЕНО в {peer_id}: {text}")
         except Exception as e:
             print("ОШИБКА ОТПРАВКИ ВК:", e)
 
 def analyze_and_generate_response(text):
-    """Анализ текста через Groq API"""
     prompt = (
         f"Проанализируй сообщение из чата: '{text}'.\n\n"
         "Твоя задача:\n"
@@ -44,7 +39,7 @@ def analyze_and_generate_response(text):
         "3. Если наезд/хамство ЕСТЬ, ответь строго в таком формате без лишних слов:\n"
         "ТОКСИК | [Имя девушки в винительном падеже (Вику / Ксюшу / Риту)] | [Короткий, смешной и ироничный комментарий бота]\n\n"
         "Пример ответа при хамстве на Вику:\n"
-        "ТОКСИК | Вику | 🚨 Обнаружена попытка задеть Вику! Наш виртуальный щит уже активирован, а зачинщику выписан штрафной балл."
+        "ТОКСИК | Вику | 🚨 Обнаружена попытка задеть Вику! Наш виртуальный щит уже активирован."
     )
     
     headers = {
@@ -61,7 +56,6 @@ def analyze_and_generate_response(text):
     try:
         response = requests.post(AI_URL, json=payload, headers=headers, timeout=7)
         result = response.json()
-        
         print("GROQ RAW RESPONSE:", result)
         
         if 'choices' in result and len(result['choices']) > 0:
@@ -84,41 +78,47 @@ def analyze_and_generate_response(text):
 def bot():
     data = request.get_json()
     
-    # Печать входящих данных в логи Render для полной отладки
-    print("VK INCOMING DATA:", data)
-    
     if not data:
         return 'ok'
 
-    # Подтверждение сервера для Callback API
-    if data.get('type') == 'confirmation':
+    event_type = data.get('type')
+    print(f"--- ВХОДЯЩЕЕ СОБЫТИЕ: {event_type} ---")
+
+    if event_type == 'confirmation':
         return CONFIRMATION_CODE
     
-    # Обработка входящего сообщения
-    if data.get('type') == 'message_new':
-        message = data['object']['message']
+    if event_type == 'message_new':
+        obj = data.get('object', {})
+        # Безопасное извлечение объекта сообщения (для разных версий API ВК)
+        message = obj.get('message', obj)
+        
         text = message.get('text', '')
         peer_id = message.get('peer_id')
         from_id = message.get('from_id')
         
+        print(f"ТЕКСТ: '{text}' | PEER_ID: {peer_id} | FROM_ID: {from_id}")
+        
+        if not peer_id:
+            return 'ok'
+
         if peer_id not in stats:
             stats[peer_id] = {}
 
-        # Команда рейтинга !топ или !рейтинг
+        # Команда !топ
         if '!топ' in text.lower() or '!рейтинг' in text.lower():
             if not stats[peer_id]:
                 send_message(peer_id, "📊 Пока никто не подкалывал девчонок!")
             else:
                 sorted_users = sorted(stats[peer_id].items(), key=lambda x: x[1], reverse=True)
                 top_text = "🏆 **ТОП самых острых на язык в беседе:**\n\n"
-                for i, (user_id, count) in enumerate(sorted_users[:10], 1):
-                    top_text += f"{i}. [id{user_id}|Участник] — {count} замеченных наездов\n"
+                for i, (u_id, count) in enumerate(sorted_users[:10], 1):
+                    top_text += f"{i}. [id{u_id}|Участник] — {count} замеченных наездов\n"
                 send_message(peer_id, top_text)
             return 'ok'
 
-        # Фильтрация по именам через regex
+        # Проверка имен
         if NAMES_PATTERN.search(text):
-            print(f"Имя обнаружено в тексте: '{text}'")
+            print(f"-> ИМЯ ОБНАРУЖЕНО в тексте '{text}'. Отправляем запрос в Groq...")
             is_toxic, target_name, ai_comment = analyze_and_generate_response(text)
             
             if is_toxic:
@@ -132,9 +132,9 @@ def bot():
                 )
                 send_message(peer_id, reply)
             else:
-                print("ИИ посчитал сообщение НЕ токсичным или произошла ошибка.")
+                print("-> ИИ ответил, что это НЕ токсик.")
         else:
-            print("Имена (Вика/Ксюша/Рита) в сообщении не найдены.")
+            print("-> Имена в тексте не совпали с регуляркой NAMES_PATTERN.")
             
         return 'ok'
 
