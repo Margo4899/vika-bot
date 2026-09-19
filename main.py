@@ -1,6 +1,5 @@
 import os
 import re
-import random
 import requests
 from flask import Flask, request
 import vk_api
@@ -9,13 +8,20 @@ from phrases import NAMES_PATTERN
 
 app = Flask(__name__)
 
-# Чтение ключей
+# Получение переменных окружения (поддержка разных названий ключей)
 VK_TOKEN = os.environ.get('VK_TOKEN', '')
 CONFIRMATION_CODE = os.environ.get('CONFIRMATION_CODE') or os.environ.get('CONFIRMATION_TOKEN', '')
 AI_API_KEY = os.environ.get('AI_API_KEY') or os.environ.get('GROQ_API_KEY', '')
 
-# Использование гарантированно доступной модели в бесплатном API Groq
-AI_MODEL = 'llama3-70b-8192'
+# Полный перечень всех доступных моделей Groq (от быстрых к мощным)
+AI_MODELS = [
+    'llama-3.3-70b-versatile',
+    'llama-3.1-8b-instant',
+    'llama-3.2-3b-preview',
+    'llama-3.2-1b-preview',
+    'mixtral-8x7b-32768',
+    'gemma2-9b-it'
+]
 AI_URL = 'https://api.groq.com/openai/v1/chat/completions'
 
 vk = vk_api.VkApi(token=VK_TOKEN) if VK_TOKEN else None
@@ -29,13 +35,13 @@ def send_message(peer_id, text):
                 'message': text,
                 'random_id': 0
             })
-            print(f"ОТПРАВЛЕНО В ВК [{peer_id}]: {text}")
+            print(f"УСПЕШНО ОТПРАВЛЕНО В ВК [{peer_id}]: {text}")
         except Exception as e:
             print("ОШИБКА ВК API:", e)
 
 def analyze_and_generate_response(text):
     if not AI_API_KEY:
-        print("ОШИБКА: Ключ API не найден в переменной окружения!")
+        print("ОШИБКА: Ключ API не найден в переменных окружения!")
         return False, None, None
 
     prompt = (
@@ -53,33 +59,42 @@ def analyze_and_generate_response(text):
         "Authorization": f"Bearer {AI_API_KEY}",
         "Content-Type": "application/json"
     }
-    
-    payload = {
-        "model": AI_MODEL,
-        "messages": [{"role": "user", "content": prompt}],
-        "temperature": 0.7
-    }
-    
-    try:
-        response = requests.post(AI_URL, json=payload, headers=headers, timeout=7)
-        result = response.json()
-        print("GROQ RAW RESPONSE:", result)
-        
-        if 'choices' in result and len(result['choices']) > 0:
-            answer = result['choices'][0]['message']['content'].strip()
-            print("AI ANSWER:", answer)
+
+    # Автоматический перебор моделей при ошибках или депрекации
+    for model_name in AI_MODELS:
+        payload = {
+            "model": model_name,
+            "messages": [{"role": "user", "content": prompt}],
+            "temperature": 0.7
+        }
+        try:
+            print(f"Пробуем модель: {model_name}...")
+            response = requests.post(AI_URL, json=payload, headers=headers, timeout=5)
+            result = response.json()
             
-            if "ТОКСИК" in answer.upper():
-                parts = answer.split("|")
-                if len(parts) >= 3:
-                    target_name = parts[1].strip()
-                    ai_comment = parts[2].strip()
-                    return True, target_name, ai_comment
-                return True, "девушку", "🚨 Фиксирую подкол! Счётчик токсичности пополнен."
-        return False, None, None
-    except Exception as e:
-        print("GROQ API ERROR:", e)
-        return False, None, None
+            if 'error' in result:
+                print(f"Модель {model_name} вернула ошибку: {result['error'].get('message')}")
+                continue
+
+            print(f"УСПЕХ НА МОДЕЛИ [{model_name}]:", result)
+            if 'choices' in result and len(result['choices']) > 0:
+                answer = result['choices'][0]['message']['content'].strip()
+                print("ОТВЕТ ИИ:", answer)
+                
+                if "ТОКСИК" in answer.upper():
+                    parts = answer.split("|")
+                    if len(parts) >= 3:
+                        target_name = parts[1].strip()
+                        ai_comment = parts[2].strip()
+                        return True, target_name, ai_comment
+                    return True, "девушку", "🚨 Фиксирую подкол! Счётчик токсичности пополнен."
+                return False, None, None
+        except Exception as e:
+            print(f"Исключение при вызове {model_name}:", e)
+            continue
+
+    print("ОШИБКА: Ни одна из резервных моделей Groq не ответила.")
+    return False, None, None
 
 @app.route('/', methods=['GET', 'POST'])
 def bot():
@@ -111,6 +126,7 @@ def bot():
         if peer_id not in stats:
             stats[peer_id] = {}
 
+        # Команды рейтинга
         if '!топ' in text.lower() or '!рейтинг' in text.lower():
             if not stats[peer_id]:
                 send_message(peer_id, "📊 Пока никто не подкалывал девчонок!")
@@ -122,6 +138,7 @@ def bot():
                 send_message(peer_id, top_text)
             return 'ok'
 
+        # Фильтр по именам
         if NAMES_PATTERN.search(text):
             print(f"Имя распознано в сообщении: '{text}'")
             is_toxic, target_name, ai_comment = analyze_and_generate_response(text)
@@ -137,7 +154,7 @@ def bot():
                 )
                 send_message(peer_id, reply)
             else:
-                print("ИИ счёл сообщение безопасным или произошла ошибка.")
+                print("ИИ счёл сообщение безопасным или все модели ответили ошибкой.")
             
         return 'ok'
 
