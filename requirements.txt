@@ -1,0 +1,4 @@
+flask
+vk_api
+requests
+gunicorn
