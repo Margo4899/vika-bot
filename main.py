@@ -14,8 +14,8 @@ VK_TOKEN = os.environ.get('VK_TOKEN', '')
 CONFIRMATION_CODE = os.environ.get('CONFIRMATION_CODE') or os.environ.get('CONFIRMATION_TOKEN', '')
 AI_API_KEY = os.environ.get('AI_API_KEY') or os.environ.get('GROQ_API_KEY', '')
 
-# Файл для сохранения статистики
-STATS_FILE = 'stats.json'
+# Путь к файлу во временной директории, где ЕСТЬ права на запись
+STATS_FILE = '/tmp/stats.json'
 
 # Актуальные модели Groq
 AI_MODELS = [
@@ -28,19 +28,16 @@ AI_URL = 'https://api.groq.com/openai/v1/chat/completions'
 
 vk = vk_api.VkApi(token=VK_TOKEN) if VK_TOKEN else None
 
-# Загрузка статистики из файла
 def load_stats():
     if os.path.exists(STATS_FILE):
         try:
             with open(STATS_FILE, 'r', encoding='utf-8') as f:
                 data = json.load(f)
-                # Преобразуем ключи обратно в числовой/булевый формат для удобства
                 return {int(k): {int(uk): uv for uk, uv in v.items()} for k, v in data.items()}
         except Exception as e:
             print("Ошибка при загрузке статистики:", e)
     return {}
 
-# Сохранение статистики в файл
 def save_stats(stats_data):
     try:
         with open(STATS_FILE, 'w', encoding='utf-8') as f:
@@ -188,7 +185,7 @@ def bot():
             
             if is_toxic:
                 stats[peer_id][from_id] = stats[peer_id].get(from_id, 0) + 1
-                save_stats(stats)  # Сохраняем сразу в файл!
+                save_stats(stats)
                 
                 user_count = stats[peer_id][from_id]
                 user_name = get_user_name(from_id)
