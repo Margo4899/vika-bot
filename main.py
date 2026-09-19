@@ -8,12 +8,10 @@ from phrases import NAMES_PATTERN
 
 app = Flask(__name__)
 
-# Чтение ключей из переменных окружения
 VK_TOKEN = os.environ.get('VK_TOKEN', '')
 CONFIRMATION_CODE = os.environ.get('CONFIRMATION_CODE', '')
 AI_API_KEY = os.environ.get('AI_API_KEY', '')
 
-# Эндпоинт и модель Groq API
 AI_URL = 'https://api.groq.com/openai/v1/chat/completions'
 AI_MODEL = 'llama-3.3-70b-versatile'
 
@@ -21,7 +19,6 @@ vk = vk_api.VkApi(token=VK_TOKEN) if VK_TOKEN else None
 stats = {}
 
 def send_message(peer_id, text):
-    """Отправка сообщения в чат ВК"""
     if vk:
         vk.method('messages.send', {
             'peer_id': peer_id,
@@ -30,10 +27,6 @@ def send_message(peer_id, text):
         })
 
 def analyze_and_generate_response(text):
-    """
-    ИИ анализирует текст сообщения на хамство/наезд на Вику, Ксюшу или Риту.
-    Возвращает статус, имя девушки и индивидуальный ответ.
-    """
     prompt = (
         f"Проанализируй сообщение из чата: '{text}'.\n\n"
         "Твоя задача:\n"
@@ -57,25 +50,35 @@ def analyze_and_generate_response(text):
     }
     
     try:
-        response = requests.post(AI_URL, json=payload, headers=headers, timeout=4)
+        response = requests.post(AI_URL, json=payload, headers=headers, timeout=5)
         result = response.json()
-        answer = result['choices'][0]['message']['content'].strip()
         
-        if answer.startswith("ТОКСИК"):
-            parts = answer.split("|")
-            if len(parts) >= 3:
-                target_name = parts[1].strip()
-                ai_comment = parts[2].strip()
-                return True, target_name, ai_comment
-            return True, "девушку", "🚨 Фиксирую подкол! Счётчик токсичности пополнен."
+        # Печатаем ответ ИИ в логи Render для отладки
+        print("GROQ RAW RESPONSE:", result)
+        
+        if 'choices' in result and len(result['choices']) > 0:
+            answer = result['choices'][0]['message']['content'].strip()
+            print("AI ANSWER:", answer)
+            
+            if "ТОКСИК" in answer.upper():
+                parts = answer.split("|")
+                if len(parts) >= 3:
+                    target_name = parts[1].strip()
+                    ai_comment = parts[2].strip()
+                    return True, target_name, ai_comment
+                return True, "девушку", "🚨 Фиксирую подкол! Счётчик токсичности пополнен."
         return False, None, None
-    except Exception:
+    except Exception as e:
+        print("GROQ API ERROR:", e)
         return False, None, None
 
 @app.route('/', methods=['POST'])
 def bot():
     data = request.get_json()
     
+    if not data:
+        return 'ok'
+
     if data.get('type') == 'confirmation':
         return CONFIRMATION_CODE
     
@@ -88,7 +91,6 @@ def bot():
         if peer_id not in stats:
             stats[peer_id] = {}
 
-        # Команда рейтинга
         if '!топ' in text.lower() or '!рейтинг' in text.lower():
             if not stats[peer_id]:
                 send_message(peer_id, "📊 Пока никто не подкалывал девчонок!")
@@ -100,8 +102,9 @@ def bot():
                 send_message(peer_id, top_text)
             return 'ok'
 
-        # Первичный поиск имени с помощью регулярного выражения
+        # Фильтр по именам
         if NAMES_PATTERN.search(text):
+            print(f"Паттерн сработал на текст: '{text}'")
             is_toxic, target_name, ai_comment = analyze_and_generate_response(text)
             if is_toxic:
                 stats[peer_id][from_id] = stats[peer_id].get(from_id, 0) + 1
@@ -113,6 +116,8 @@ def bot():
                     f"📈 Ваша статистика в банке токсичности: **{user_count}**"
                 )
                 send_message(peer_id, reply)
+            else:
+                print("ИИ посчитал сообщение НЕ токсичным или произошла ошибка.")
             
         return 'ok'
 
