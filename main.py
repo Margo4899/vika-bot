@@ -1,125 +1,147 @@
 import os
 import re
-import random
+import requests
 from flask import Flask, request
 import vk_api
-import requests
 
-# Инициализация Flask приложения
+from phrases import NAMES_PATTERN
+
 app = Flask(__name__)
 
-# Токены из переменных окружения
-VK_TOKEN = os.environ.get("VK_TOKEN")
-CONFIRMATION_TOKEN = os.environ.get("CONFIRMATION_TOKEN")
-GROQ_API_KEY = os.environ.get("GROQ_API_KEY")
+# Берём ключи из переменных Render (поддерживаем и AI_API_KEY, и GROQ_API_KEY)
+VK_TOKEN = os.environ.get('VK_TOKEN', '')
+CONFIRMATION_CODE = os.environ.get('CONFIRMATION_CODE') or os.environ.get('CONFIRMATION_TOKEN', '')
+AI_API_KEY = os.environ.get('AI_API_KEY') or os.environ.get('GROQ_API_KEY', '')
 
-# Авторизация в ВК API
-vk_session = vk_api.VkApi(token=VK_TOKEN)
-vk = vk_session.get_api()
+# Актуальные модели Groq: 'llama-3.3-70b-versatile' или 'llama-3.1-8b-instant'
+AI_MODEL = 'llama-3.3-70b-versatile'
+AI_URL = 'https://api.groq.com/openai/v1/chat/completions'
 
-# Актуальная модель Groq API
-AI_MODEL = "openai/gpt-oss-120b"
+vk = vk_api.VkApi(token=VK_TOKEN) if VK_TOKEN else None
+stats = {}
 
+def send_message(peer_id, text):
+    if vk:
+        try:
+            vk.method('messages.send', {
+                'peer_id': peer_id,
+                'message': text,
+                'random_id': 0
+            })
+            print(f"ОТПРАВЛЕНО В ВК [{peer_id}]: {text}")
+        except Exception as e:
+            print("ОШИБКА ВК API:", e)
 
-def ask_groq_safety(user_text):
-    """Отправляет запрос в Groq API для проверки на оскорбление."""
-    if not GROQ_API_KEY:
-        print("ОШИБКА: GROQ_API_KEY не установлен!")
-        return False, None
-
-    url = "https://api.groq.com/openai/v1/chat/completions"
-    headers = {
-        "Authorization": f"Bearer {GROQ_API_KEY}",
-        "Content-Type": "application/json",
-    }
+def analyze_and_generate_response(text):
+    if not AI_API_KEY:
+        print("ОШИБКА: Ключ API не найден в переменных окружения!")
+        return False, None, None
 
     prompt = (
-        f"Проанализируй текст: '{user_text}'. "
-        "Определи, является ли это оскорблением, негативом или неуважением в адрес Вики/Викульки/бота. "
-        "Ответь строго в формате JSON без дополнительного текста и без markdown-разметки: "
-        '{"is_insult": true/false, "reply": "ироничный и колкий ответ боту в 1 предложении"}.'
+        f"Проанализируй сообщение из чата: '{text}'.\n\n"
+        "Твоя задача:\n"
+        "1. Определи, адресован ли тут подкол, хамство, сарказм, ирония или наезд на девушку по имени Вика, Ксюша или Рита (или их формы/опечатки).\n"
+        "2. Если наезда/хамства НЕТ или имя не относится к этой троице, ответь строго одним словом: НОРМА.\n"
+        "3. Если наезд/хамство ЕСТЬ, ответь строго в таком формате без лишних слов:\n"
+        "ТОКСИК | [Имя девушки в винительном падеже (Вику / Ксюшу / Риту)] | [Короткий, смешной и ироничный комментарий бота]\n\n"
+        "Пример ответа при хамстве на Вику:\n"
+        "ТОКСИК | Вику | 🚨 Обнаружена попытка задеть Вику! Наш виртуальный щит уже активирован."
     )
-
-    data = {
+    
+    headers = {
+        "Authorization": f"Bearer {AI_API_KEY}",
+        "Content-Type": "application/json"
+    }
+    
+    payload = {
         "model": AI_MODEL,
         "messages": [{"role": "user", "content": prompt}],
-        "temperature": 0.5,
+        "temperature": 0.7
     }
-
+    
     try:
-        response = requests.post(url, headers=headers, json=data, timeout=5)
-        res_json = response.json()
-
-        if "choices" in res_json and len(res_json["choices"]) > 0:
-            content = res_json["choices"][0]["message"]["content"].strip()
-            print(f"ОТВЕТ ИИ: {content}")
-
-            # Ищем флаг is_insult
-            is_insult = '"is_insult": true' in content.lower()
-
-            # Извлекаем текст ответа
-            reply_match = re.search(r'"reply"\s*:\s*"([^"]+)"', content)
-            reply = (
-                reply_match.group(1)
-                if reply_match
-                else "Сам такой, между прочим!"
-            )
-
-            return is_insult, reply
-        else:
-            print(f"Ошибка Groq API: {res_json}")
-            return False, None
+        response = requests.post(AI_URL, json=payload, headers=headers, timeout=7)
+        result = response.json()
+        print("GROQ RAW RESPONSE:", result)
+        
+        if 'choices' in result and len(result['choices']) > 0:
+            answer = result['choices'][0]['message']['content'].strip()
+            print("AI ANSWER:", answer)
+            
+            if "ТОКСИК" in answer.upper():
+                parts = answer.split("|")
+                if len(parts) >= 3:
+                    target_name = parts[1].strip()
+                    ai_comment = parts[2].strip()
+                    return True, target_name, ai_comment
+                return True, "девушку", "🚨 Фиксирую подкол! Счётчик токсичности пополнен."
+        return False, None, None
     except Exception as e:
-        print(f"Исключение при вызове Groq: {e}")
-        return False, None
+        print("GROQ API ERROR:", e)
+        return False, None, None
 
+@app.route('/', methods=['GET', 'POST'])
+def bot():
+    if request.method == 'GET':
+        return 'Bot is running alive!', 200
 
-@app.route("/", methods=["POST"])
-def callback():
     data = request.get_json(force=True, silent=True)
     if not data:
-        return "not ok"
+        return 'ok'
 
-    event_type = data.get("type")
+    print("ВХОДЯЩИЕ ДАННЫЕ ОТ ВК:", data)
 
-    # Подтверждение сервера VK
-    if event_type == "confirmation":
-        return CONFIRMATION_TOKEN
+    event_type = data.get('type')
 
-    # Новое сообщение
-    if event_type == "message_new":
-        message = data.get("object", {}).get("message", {})
-        text = message.get("text", "")
-        peer_id = message.get("peer_id")
+    if event_type == 'confirmation':
+        return CONFIRMATION_CODE
+    
+    if event_type == 'message_new':
+        obj = data.get('object', {})
+        message = obj.get('message', obj)
+        
+        text = message.get('text', '')
+        peer_id = message.get('peer_id')
+        from_id = message.get('from_id')
+        
+        if not peer_id:
+            return 'ok'
 
-        print(f"ВХОДЯЩЕЕ СООБЩЕНИЕ: {text}")
+        if peer_id not in stats:
+            stats[peer_id] = {}
 
-        # Регулярка для проверки упоминания бота
-        if re.search(r"\b(вика|викулька|вике|вику)\b", text, re.IGNORECASE):
-            print(f"Имя распознано в сообщении: '{text}'")
-
-            is_insult, ai_reply = ask_groq_safety(text)
-
-            if is_insult:
-                print("ИИ распознал оскорбление! Отправляем ответ.")
-                vk.messages.send(
-                    peer_id=peer_id,
-                    message=ai_reply,
-                    random_id=random.randint(1, 1000000),
-                )
+        if '!топ' in text.lower() or '!рейтинг' in text.lower():
+            if not stats[peer_id]:
+                send_message(peer_id, "📊 Пока никто не подкалывал девчонок!")
             else:
-                print("ИИ счёл сообщение безопасным.")
+                sorted_users = sorted(stats[peer_id].items(), key=lambda x: x[1], reverse=True)
+                top_text = "🏆 **ТОП самых острых на язык в беседе:**\n\n"
+                for i, (u_id, count) in enumerate(sorted_users[:10], 1):
+                    top_text += f"{i}. [id{u_id}|Участник] — {count} замеченных наездов\n"
+                send_message(peer_id, top_text)
+            return 'ok'
 
-        return "ok"
+        if NAMES_PATTERN.search(text):
+            print(f"Имя распознано в сообщении: '{text}'")
+            is_toxic, target_name, ai_comment = analyze_and_generate_response(text)
+            
+            if is_toxic:
+                stats[peer_id][from_id] = stats[peer_id].get(from_id, 0) + 1
+                user_count = stats[peer_id][from_id]
+                
+                reply = (
+                    f"{ai_comment}\n\n"
+                    f"🛡️ **Защита:** [id{from_id}|Участник], зафиксирован наезд на **{target_name}**!\n"
+                    f"📈 Ваша статистика в банке токсичности: **{user_count}**"
+                )
+                send_message(peer_id, reply)
+            else:
+                print("ИИ счёл сообщение безопасным или произошла ошибка.")
+            
+        return 'ok'
 
-    return "ok"
+    return 'ok'
 
-
-@app.route("/", methods=["GET"])
-def index():
-    return "Bot is running!"
-
-
-if __name__ == "__main__":
-    port = int(os.environ.get("PORT", 5000))
-    app.run(host="0.0.0.0", port=port)
+if __name__ == '__main__':
+    port = int(os.environ.get('PORT', 5000))
+    app.run(host='0.0.0.0', port=port)
