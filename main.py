@@ -26,9 +26,9 @@ def send_message(peer_id, text):
                 'message': text,
                 'random_id': 0
             })
-            print(f"УСПЕШНО ОТПРАВЛЕНО в {peer_id}: {text}")
+            print(f"ОТПРАВЛЕНО В ВК [{peer_id}]: {text}")
         except Exception as e:
-            print("ОШИБКА ОТПРАВКИ ВК:", e)
+            print("ОШИБКА ВК API:", e)
 
 def analyze_and_generate_response(text):
     prompt = (
@@ -74,29 +74,30 @@ def analyze_and_generate_response(text):
         print("GROQ API ERROR:", e)
         return False, None, None
 
-@app.route('/', methods=['POST'])
+# Добавили GET, чтобы Render не считал сервис мёртвым!
+@app.route('/', methods=['GET', 'POST'])
 def bot():
+    if request.method == 'GET':
+        return 'Bot is running alive!', 200
+
     data = request.get_json()
-    
+    print("ВХОДЯЩИЕ ДАННЫЕ ОТ ВК:", data)
+
     if not data:
         return 'ok'
 
     event_type = data.get('type')
-    print(f"--- ВХОДЯЩЕЕ СОБЫТИЕ: {event_type} ---")
 
     if event_type == 'confirmation':
         return CONFIRMATION_CODE
     
     if event_type == 'message_new':
         obj = data.get('object', {})
-        # Безопасное извлечение объекта сообщения (для разных версий API ВК)
         message = obj.get('message', obj)
         
         text = message.get('text', '')
         peer_id = message.get('peer_id')
         from_id = message.get('from_id')
-        
-        print(f"ТЕКСТ: '{text}' | PEER_ID: {peer_id} | FROM_ID: {from_id}")
         
         if not peer_id:
             return 'ok'
@@ -104,7 +105,6 @@ def bot():
         if peer_id not in stats:
             stats[peer_id] = {}
 
-        # Команда !топ
         if '!топ' in text.lower() or '!рейтинг' in text.lower():
             if not stats[peer_id]:
                 send_message(peer_id, "📊 Пока никто не подкалывал девчонок!")
@@ -116,9 +116,8 @@ def bot():
                 send_message(peer_id, top_text)
             return 'ok'
 
-        # Проверка имен
         if NAMES_PATTERN.search(text):
-            print(f"-> ИМЯ ОБНАРУЖЕНО в тексте '{text}'. Отправляем запрос в Groq...")
+            print(f"Имя распознано в сообщении: '{text}'")
             is_toxic, target_name, ai_comment = analyze_and_generate_response(text)
             
             if is_toxic:
@@ -132,9 +131,7 @@ def bot():
                 )
                 send_message(peer_id, reply)
             else:
-                print("-> ИИ ответил, что это НЕ токсик.")
-        else:
-            print("-> Имена в тексте не совпали с регуляркой NAMES_PATTERN.")
+                print("ИИ счёл сообщение безопасным.")
             
         return 'ok'
 
