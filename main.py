@@ -1,5 +1,6 @@
 import os
 import re
+import json
 import requests
 from flask import Flask, request
 import vk_api
@@ -13,6 +14,9 @@ VK_TOKEN = os.environ.get('VK_TOKEN', '')
 CONFIRMATION_CODE = os.environ.get('CONFIRMATION_CODE') or os.environ.get('CONFIRMATION_TOKEN', '')
 AI_API_KEY = os.environ.get('AI_API_KEY') or os.environ.get('GROQ_API_KEY', '')
 
+# Файл для сохранения статистики
+STATS_FILE = 'stats.json'
+
 # Актуальные модели Groq
 AI_MODELS = [
     'openai/gpt-oss-120b',
@@ -23,8 +27,29 @@ AI_MODELS = [
 AI_URL = 'https://api.groq.com/openai/v1/chat/completions'
 
 vk = vk_api.VkApi(token=VK_TOKEN) if VK_TOKEN else None
-stats = {}
-user_names_cache = {}  # Кэш для имён, чтобы не спамить запросами к ВК
+
+# Загрузка статистики из файла
+def load_stats():
+    if os.path.exists(STATS_FILE):
+        try:
+            with open(STATS_FILE, 'r', encoding='utf-8') as f:
+                data = json.load(f)
+                # Преобразуем ключи обратно в числовой/булевый формат для удобства
+                return {int(k): {int(uk): uv for uk, uv in v.items()} for k, v in data.items()}
+        except Exception as e:
+            print("Ошибка при загрузке статистики:", e)
+    return {}
+
+# Сохранение статистики в файл
+def save_stats(stats_data):
+    try:
+        with open(STATS_FILE, 'w', encoding='utf-8') as f:
+            json.dump(stats_data, f, ensure_ascii=False, indent=2)
+    except Exception as e:
+        print("Ошибка при сохранении статистики:", e)
+
+stats = load_stats()
+user_names_cache = {}
 
 def send_message(peer_id, text):
     if vk:
@@ -39,7 +64,6 @@ def send_message(peer_id, text):
             print("ОШИБКА ВК API:", e)
 
 def get_user_name(user_id):
-    """Получает имя и фамилию пользователя по его ID"""
     if user_id in user_names_cache:
         return user_names_cache[user_id]
     
@@ -164,8 +188,9 @@ def bot():
             
             if is_toxic:
                 stats[peer_id][from_id] = stats[peer_id].get(from_id, 0) + 1
-                user_count = stats[peer_id][from_id]
+                save_stats(stats)  # Сохраняем сразу в файл!
                 
+                user_count = stats[peer_id][from_id]
                 user_name = get_user_name(from_id)
                 
                 reply = (
