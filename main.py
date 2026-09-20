@@ -9,15 +9,15 @@ from phrases import NAMES_PATTERN
 
 app = Flask(__name__)
 
-# Получение переменных окружения
+# Переменные окружения
 VK_TOKEN = os.environ.get('VK_TOKEN', '')
 CONFIRMATION_CODE = os.environ.get('CONFIRMATION_CODE') or os.environ.get('CONFIRMATION_TOKEN', '')
 AI_API_KEY = os.environ.get('AI_API_KEY') or os.environ.get('GROQ_API_KEY', '')
 
-# Путь к файлу во временной директории, где ЕСТЬ права на запись
-STATS_FILE = '/tmp/stats.json'
+# Переменные для постоянного хранения через JSONBin
+JSONBIN_BIN_ID = os.environ.get('JSONBIN_BIN_ID', '')
+JSONBIN_API_KEY = os.environ.get('JSONBIN_API_KEY', '')
 
-# Актуальные модели Groq
 AI_MODELS = [
     'openai/gpt-oss-120b',
     'openai/gpt-oss-20b',
@@ -26,24 +26,59 @@ AI_MODELS = [
 ]
 AI_URL = 'https://api.groq.com/openai/v1/chat/completions'
 
+# Расширенный список хамских слов и наездов (50+ триггеров)
+BAD_WORDS = [
+    # Хамство и наглость
+    r'хам', r'хамк[аеуо]', r'хамы', r'хамишь', r'хамит', r'хамло', r'хамств[оа]',
+    r'нахал', r'нахалк[аеуо]', r me'нахалы', r'наглец', r'нагл[аяыео]', r'обнаглел', r'обнаглел[аи]',
+    r'дерзк[аяыео]', r'дерзишь', r'выпендриваешься', r'понтишься', r'понт[ыов]',
+    
+    # Оскорбления и обзывательства
+    r'дур[аеуоя]', r'дурак', r'идиот', r'идиотк[аеуо]', r'туп[аяеоуи]', r'тупица',
+    r'твар[ьй]', r'клоун', r'придурок', r'гнид[аеуо]', r'кончен[аяые]', r'урод',
+    r'мраз[ьи]', r'чушпан', r'бесит', r'бесишь', r'сволоч[ьй]', r'шлюх[аеуо]', r'бред',
+    
+    # Грубые приказы и фразы-выпады
+    r'заткнись', r'завали', r'закройся', r'пошел', r'пошла', r'соси', r'отвали',
+    r'свали', r'исчезни', r'пошла_вон', r'пошел_вон', r'съеби', r'съебись',
+    r'оффнись', r'рот_закрой', r'не_пизди', r'чушь', r'ахринел', r'офигел', r'офигел[аи]'
+]
+BAD_WORDS_PATTERN = re.compile(r'\b(' + r'|'.join(BAD_WORDS) + r')\b', re.IGNORECASE)
+
 vk = vk_api.VkApi(token=VK_TOKEN) if VK_TOKEN else None
 
 def load_stats():
-    if os.path.exists(STATS_FILE):
-        try:
-            with open(STATS_FILE, 'r', encoding='utf-8') as f:
-                data = json.load(f)
-                return {int(k): {int(uk): uv for uk, uv in v.items()} for k, v in data.items()}
-        except Exception as e:
-            print("Ошибка при загрузке статистики:", e)
+    """Загружает статистику из облака JSONBin"""
+    if not JSONBIN_BIN_ID or not JSONBIN_API_KEY:
+        print("ВНИМАНИЕ: Ключи JSONBin не настроены. Используется локальная память.")
+        return {}
+    
+    url = f"https://api.jsonbin.io/v3/b/{JSONBIN_BIN_ID}/latest"
+    headers = {"X-Master-Key": JSONBIN_API_KEY}
+    try:
+        res = requests.get(url, headers=headers, timeout=5)
+        if res.status_code == 200:
+            record = res.json().get('record', {})
+            return {int(k): {int(uk): uv for uk, uv in v.items()} for k, v in record.items()}
+    except Exception as e:
+        print("Ошибка загрузки статистики из облака:", e)
     return {}
 
 def save_stats(stats_data):
+    """Сохраняет статистику в облако JSONBin"""
+    if not JSONBIN_BIN_ID or not JSONBIN_API_KEY:
+        return
+    
+    url = f"https://api.jsonbin.io/v3/b/{JSONBIN_BIN_ID}"
+    headers = {
+        "Content-Type": "application/json",
+        "X-Master-Key": JSONBIN_API_KEY
+    }
     try:
-        with open(STATS_FILE, 'w', encoding='utf-8') as f:
-            json.dump(stats_data, f, ensure_ascii=False, indent=2)
+        requests.put(url, json=stats_data, headers=headers, timeout=5)
+        print("Статистика успешно сохранена в облаке!")
     except Exception as e:
-        print("Ошибка при сохранении статистики:", e)
+        print("Ошибка сохранения статистики в облако:", e)
 
 stats = load_stats()
 user_names_cache = {}
@@ -56,7 +91,6 @@ def send_message(peer_id, text):
                 'message': text,
                 'random_id': 0
             })
-            print(f"УСПЕШНО ОТПРАВЛЕНО В ВК [{peer_id}]: {text}")
         except Exception as e:
             print("ОШИБКА ВК API:", e)
 
@@ -81,18 +115,17 @@ def get_user_name(user_id):
 
 def analyze_and_generate_response(text):
     if not AI_API_KEY:
-        print("ОШИБКА: Ключ API не найден в переменных окружения!")
         return False, None, None
 
     prompt = (
         f"Проанализируй сообщение из чата: '{text}'.\n\n"
         "Твоя задача:\n"
-        "1. Определи, адресован ли тут подкол, хамство, сарказм, ирония или наезд на девушку по имени Вика, Ксюша или Рита (или их формы/опечатки).\n"
-        "2. Если наезда/хамства НЕТ или имя не относится к этой троице, ответь строго одним словом: НОРМА.\n"
-        "3. Если наезд/хамство ЕСТЬ, ответь строго в таком формате без лишних слов и рассуждений:\n"
-        "ТОКСИК | [Имя девушки в винительном падеже (Вику / Ксюшу / Риту)] | [Короткий, смешной и ироничный комментарий бота]\n\n"
-        "Пример ответа при хамстве на Вику:\n"
-        "ТОКСИК | Вику | 🚨 Обнаружена попытка задеть Вику! Наш виртуальный щит уже активирован."
+        "1. Определи, есть ли тут токсичность, подкол, хамство, грубость, сарказм или наезд на участника беседы (или конкретно на Вику / Ксюшу / Риту).\n"
+        "2. Если хамства/наезда НЕТ (это просто обычная беседа или безобидная шутка), ответь строго одним словом: НОРМА.\n"
+        "3. Если хамство/наезд ЕСТЬ, ответь строго в таком формате без лишних слов:\n"
+        "ТОКСИК | [Кого задели/на кого наезд, например: Вику / Ксюшу / Риту / участников чата] | [Короткий, смешной и ироничный комментарий бота]\n\n"
+        "Пример ответа при хамстве:\n"
+        "ТОКСИК | участников чата | 🚨 Обнаружен всплеск токсичности! Включаю режим миротворца."
     )
     
     headers = {
@@ -107,15 +140,12 @@ def analyze_and_generate_response(text):
             "temperature": 0.7
         }
         try:
-            print(f"Пробуем модель: {model_name}...")
             response = requests.post(AI_URL, json=payload, headers=headers, timeout=5)
             result = response.json()
             
             if 'error' in result:
-                print(f"Модель {model_name} вернула ошибку: {result['error'].get('message')}")
                 continue
 
-            print(f"УСПЕХ НА МОДЕЛИ [{model_name}]:", result)
             if 'choices' in result and len(result['choices']) > 0:
                 full_content = result['choices'][0]['message']['content'].strip()
                 
@@ -128,13 +158,11 @@ def analyze_and_generate_response(text):
                         target_name = parts[1].strip()
                         ai_comment = parts[2].strip()
                         return True, target_name, ai_comment
-                    return True, "девушку", "🚨 Фиксирую подкол! Счётчик токсичности пополнен."
+                    return True, "участников чата", "🚨 Фиксирую подкол! Счётчик токсичности пополнен."
                 return False, None, None
-        except Exception as e:
-            print(f"Исключение при вызове {model_name}:", e)
+        except Exception:
             continue
 
-    print("ОШИБКА: Ни одна из моделей не ответила.")
     return False, None, None
 
 @app.route('/', methods=['GET', 'POST'])
@@ -145,8 +173,6 @@ def bot():
     data = request.get_json(force=True, silent=True)
     if not data:
         return 'ok'
-
-    print("ВХОДЯЩИЕ ДАННЫЕ ОТ ВК:", data)
 
     event_type = data.get('type')
 
@@ -169,7 +195,7 @@ def bot():
 
         if '!топ' in text.lower() or '!рейтинг' in text.lower():
             if not stats[peer_id]:
-                send_message(peer_id, "📊 Пока никто не подкалывал девчонок!")
+                send_message(peer_id, "📊 Пока никто не токсичил в беседе!")
             else:
                 sorted_users = sorted(stats[peer_id].items(), key=lambda x: x[1], reverse=True)
                 top_text = "🏆 ТОП самых острых на язык в беседе:\n\n"
@@ -179,8 +205,8 @@ def bot():
                 send_message(peer_id, top_text)
             return 'ok'
 
-        if NAMES_PATTERN.search(text):
-            print(f"Имя распознано в сообщении: '{text}'")
+        # Поиск по именам девчонок или по словарю хамских слов
+        if NAMES_PATTERN.search(text) or BAD_WORDS_PATTERN.search(text):
             is_toxic, target_name, ai_comment = analyze_and_generate_response(text)
             
             if is_toxic:
@@ -192,12 +218,10 @@ def bot():
                 
                 reply = (
                     f"{ai_comment}\n\n"
-                    f"🛡️ Защита: [id{from_id}|{user_name}], зафиксирован наезд на {target_name}!\n"
+                    f"🛡️ Фиксация: [id{from_id}|{user_name}], зафиксирован наезд на {target_name}!\n"
                     f"📈 Ваша статистика в банке токсичности: {user_count}"
                 )
                 send_message(peer_id, reply)
-            else:
-                print("ИИ счёл сообщение безопасным или произошла ошибка.")
             
         return 'ok'
 
