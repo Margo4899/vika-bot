@@ -19,14 +19,13 @@ JSONBIN_BIN_ID = os.environ.get('JSONBIN_BIN_ID', '')
 JSONBIN_API_KEY = os.environ.get('JSONBIN_API_KEY', '')
 
 AI_MODELS = [
-    'openai/gpt-oss-120b',
-    'openai/gpt-oss-20b',
-    'qwen/qwen3.8-27b',
-    'qwen/qwen3.6-27b'
+    'llama-3.3-70b-versatile',
+    'llama3-70b-8192',
+    'mixtral-8x7b-32768'
 ]
 AI_URL = 'https://api.groq.com/openai/v1/chat/completions'
 
-# Отрывки и корни слов (без \b, чтобы находить любые формы и однокоренные слова)
+# Отрывки и корни слов
 BAD_WORDS = [
     # Хамство, наглость, дерзость
     r'хам', r'нахал', r'нагл', r'дерз', r'выпендр', r'понт',
@@ -114,17 +113,14 @@ def get_user_name(user_id):
 
 def analyze_and_generate_response(text):
     if not AI_API_KEY:
+        print("ОШИБКА: НЕТ AI_API_KEY!")
         return False, None, None
 
     prompt = (
-        f"Проанализируй сообщение из чата: '{text}'.\n\n"
-        "Твоя задача:\n"
-        "1. Определи, есть ли тут токсичность, подкол, хамство, грубость, сарказм или наезд на участника беседы (или конкретно на Вику / Ксюшу / Риту).\n"
-        "2. Если хамства/наезда НЕТ (это просто обычная беседа или безобидная шутка), ответь строго одним словом: НОРМА.\n"
-        "3. Если хамство/наезд ЕСТЬ, ответь строго в таком формате без лишних слов:\n"
-        "ТОКСИК | [Кого задели/на кого наезд, например: Вику / Ксюшу / Риту / участников чата] | [Короткий, смешной и ироничный комментарий бота]\n\n"
-        "Пример ответа при хамстве:\n"
-        "ТОКСИК | участников чата | 🚨 Обнаружен всплеск токсичности! Включаю режим миротворца."
+        f"Проанализируй текст: '{text}'.\n\n"
+        "Если в тексте есть грубость, хамство, наезд, подкол, маты или упоминание слов-триггеров (хам, дура, идиот и т.д.), ответь строго так:\n"
+        "ТОКСИК | [Кого задели, например: Вику / Ксюшу / Риту / участников чата] | [Короткий, острый комментарий бота]\n\n"
+        "Если это абсолютно дружелюбное, обычное предложение БЕЗ наездов, ответь строго одним словом: НОРМА"
     )
     
     headers = {
@@ -136,17 +132,15 @@ def analyze_and_generate_response(text):
         payload = {
             "model": model_name,
             "messages": [{"role": "user", "content": prompt}],
-            "temperature": 0.7
+            "temperature": 0.5
         }
         try:
             response = requests.post(AI_URL, json=payload, headers=headers, timeout=5)
             result = response.json()
             
-            if 'error' in result:
-                continue
-
             if 'choices' in result and len(result['choices']) > 0:
                 full_content = result['choices'][0]['message']['content'].strip()
+                print(f"ОТВЕТ ИИ ({model_name}): {full_content}") # Логирование в Render!
                 
                 if "ТОКСИК" in full_content.upper():
                     toxic_index = full_content.upper().find("ТОКСИК")
@@ -158,8 +152,10 @@ def analyze_and_generate_response(text):
                         ai_comment = parts[2].strip()
                         return True, target_name, ai_comment
                     return True, "участников чата", "🚨 Фиксирую подкол! Счётчик токсичности пополнен."
-                return False, None, None
-        except Exception:
+                elif "НОРМА" in full_content.upper():
+                    return False, None, None
+        except Exception as e:
+            print(f"Ошибка запроса к ИИ ({model_name}):", e)
             continue
 
     return False, None, None
@@ -204,8 +200,9 @@ def bot():
                 send_message(peer_id, top_text)
             return 'ok'
 
-        # Поиск по именам девчонок или по отрывкам хамских слов
+        # Проверка ключевых слов
         if NAMES_PATTERN.search(text) or BAD_WORDS_PATTERN.search(text):
+            print(f"Найден триггер в сообщении: '{text}'") # Лог срабатывания триггера
             is_toxic, target_name, ai_comment = analyze_and_generate_response(text)
             
             if is_toxic:
