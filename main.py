@@ -10,7 +10,7 @@ from phrases import NAMES_PATTERN
 
 app = Flask(__name__)
 
-# Переменные окружения из панелей типа Render
+# Переменные окружения из Render
 VK_TOKEN = os.environ.get('VK_TOKEN', '')
 CONFIRMATION_CODE = os.environ.get('CONFIRMATION_CODE', '')
 AI_API_KEY = os.environ.get('AI_API_KEY', '')
@@ -50,29 +50,49 @@ BAD_WORDS_PATTERN = re.compile(r'|'.join(BAD_WORDS), re.IGNORECASE)
 vk = vk_api.VkApi(token=VK_TOKEN) if VK_TOKEN else None
 
 def load_stats():
+    """Загружает статистику из облака JSONBin"""
     if not JSONBIN_BIN_ID or not JSONBIN_API_KEY:
+        print("ВНИМАНИЕ: JSONBin не настроен.")
         return {}
+    
     url = f"https://api.jsonbin.io/v3/b/{JSONBIN_BIN_ID}/latest"
     headers = {"X-Master-Key": JSONBIN_API_KEY}
     try:
         res = requests.get(url, headers=headers, timeout=5)
         if res.status_code == 200:
-            record = res.json().get('record', {})
-            return {int(k): {int(uk): uv for uk, uv in v.items()} for k, v in record.items()}
+            data = res.json()
+            record = data.get('record', {})
+            # Преобразуем ключи обратно в int
+            loaded = {}
+            for k, v in record.items():
+                if isinstance(v, dict):
+                    loaded[int(k)] = {int(uk): int(uv) for uk, uv in v.items()}
+            print("Статистика успешно загружена из облака!")
+            return loaded
+        else:
+            print(f"Ошибка загрузки JSONBin [{res.status_code}]: {res.text}")
     except Exception as e:
         print("Ошибка загрузки статистики:", e)
     return {}
 
 def save_stats(stats_data):
+    """Сохраняет статистику в облако JSONBin"""
     if not JSONBIN_BIN_ID or not JSONBIN_API_KEY:
         return
+    
     url = f"https://api.jsonbin.io/v3/b/{JSONBIN_BIN_ID}"
     headers = {
         "Content-Type": "application/json",
         "X-Master-Key": JSONBIN_API_KEY
     }
     try:
-        requests.put(url, json=stats_data, headers=headers, timeout=5)
+        # Преобразуем int ключи в str для корректного JSON
+        serializable_stats = {str(k): {str(uk): uv for uk, uv in v.items()} for k, v in stats_data.items()}
+        res = requests.put(url, json=serializable_stats, headers=headers, timeout=5)
+        if res.status_code == 200:
+            print("Статистика успешно сохранена в облаке!")
+        else:
+            print(f"Ошибка сохранения JSONBin [{res.status_code}]: {res.text}")
     except Exception as e:
         print("Ошибка сохранения статистики:", e)
 
@@ -108,24 +128,21 @@ def get_user_name(user_id):
     return "Участник"
 
 def analyze_and_generate_response(text):
-    # Очищаем ключ от скрытых символов и пробелов
     clean_key = AI_API_KEY.strip() if AI_API_KEY else ""
     if not clean_key:
-        print("ОШИБКА: AI_API_KEY пустой в Environment Variables!")
-        return True, "участников чата", random.choice(FALLBACK_COMMENTS)
+        print("ОШИБКА: AI_API_KEY пустой!")
+        return False, "участников чата", ""
 
     system_instruction = (
-        "Ты — саркастичный и ироничный бот-судья в молодежном чате ВКонтакте. "
-        "Твоя единственная задача — коротко, остроумно и смешно прокомментировать подкол, грубость или наезд от участника чата. "
-        "СТРОГО ЗАПРЕЩЕНО писать отказы вроде 'Я не могу с этим помочь', 'Я не поддерживаю грубость', морализаторские лекции или абстрактный бред. "
-        "Всегда сохраняй игровой контекст и ролевую игру бота!"
+        "Ты — судья и модератор в чате ВКонтакте. "
+        "Твоя задача — определить, содержит ли сообщение участника НАЕЗД, ОСКОРБЛЕНИЕ, ГРУБОСТЬ или ТОКСИЧНОСТЬ.\n\n"
+        "ВАЖНО:\n"
+        "1. Если фразa ДОБРАЯ, НЕЙТРАЛЬНАЯ или просто упоминание имени (например, 'Викулька', 'Привет', 'Как дела'), отвeчай СТРОГО: НЕ_ТОКСИК\n"
+        "2. Если фраза ТОКСИЧНАЯ или содержит подкол/наезд/грубость, ответь строго в формате:\n"
+        "ТОКСИК | [Кого задели: Вику / Ксюшу / Риту / участников чата] | [Короткий смешной и саркастичный комментарий бота]"
     )
 
-    user_prompt = (
-        f"Участник написал сообщение: '{text}'.\n\n"
-        "Сгенерируй реакцию строго в следующем формате:\n"
-        "ТОКСИК | [Кого задели: Вику / Ксюшу / Риту / участников чата] | [Короткий смешной комментарий бота без моралей и занудства]"
-    )
+    user_prompt = f"Проанализируй сообщение из чата: '{text}'"
     
     headers = {
         "Authorization": f"Bearer {clean_key}",
@@ -139,7 +156,7 @@ def analyze_and_generate_response(text):
                 {"role": "system", "content": system_instruction},
                 {"role": "user", "content": user_prompt}
             ],
-            "temperature": 0.7
+            "temperature": 0.3
         }
         try:
             response = requests.post(AI_URL, json=payload, headers=headers, timeout=7)
@@ -149,12 +166,10 @@ def analyze_and_generate_response(text):
                 full_content = result['choices'][0]['message']['content'].strip()
                 full_content = re.sub(r'<think>.*?</think>', '', full_content, flags=re.DOTALL).strip()
                 
-                lower_content = full_content.lower()
-                if "не могу" in lower_content or "как ии" in lower_content or "к сожалению" in lower_content:
-                    print(f"Модель {model_name} выдала отписку, пробуем следующую...")
-                    continue
+                print(f"ОТВЕТ ИИ ({model_name}): {full_content}")
 
-                print(f"УСПЕШНЫЙ ОТВЕТ ИИ ({model_name}): {full_content}")
+                if "НЕ_ТОКСИК" in full_content or "НЕ ТОКСИК" in full_content:
+                    return False, "участников чата", ""
                 
                 parts = full_content.split("|")
                 if len(parts) >= 3:
@@ -162,14 +177,14 @@ def analyze_and_generate_response(text):
                 elif len(parts) == 2:
                     return True, "участников чата", parts[1].strip()
                 else:
-                    return True, "участников чата", full_content
+                    return True, "участников чата", random.choice(FALLBACK_COMMENTS)
             else:
                 print(f"Сбой ИИ ({model_name}) [{response.status_code}]: {result}")
         except Exception as e:
             print(f"Ошибка запроса к ИИ ({model_name}):", e)
             continue
 
-    return True, "участников чата", random.choice(FALLBACK_COMMENTS)
+    return False, "участников чата", ""
 
 @app.route('/', methods=['GET', 'POST'])
 def bot():
@@ -199,6 +214,7 @@ def bot():
         if peer_id not in stats:
             stats[peer_id] = {}
 
+        # Команда просмотра рейтинга
         if '!топ' in text.lower() or '!рейтинг' in text.lower():
             if not stats[peer_id]:
                 send_message(peer_id, "📊 Пока никто не токсичил в беседе!")
@@ -211,9 +227,11 @@ def bot():
                 send_message(peer_id, top_text)
             return 'ok'
 
+        # Проверяем ключевые слова
         if NAMES_PATTERN.search(text) or BAD_WORDS_PATTERN.search(text):
             is_toxic, target_name, ai_comment = analyze_and_generate_response(text)
             
+            # Начисляем баллы ТОЛЬКО если ИИ подтвердил токсичность
             if is_toxic:
                 stats[peer_id][from_id] = stats[peer_id].get(from_id, 0) + 1
                 save_stats(stats)
