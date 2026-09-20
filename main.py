@@ -51,18 +51,20 @@ vk = vk_api.VkApi(token=VK_TOKEN) if VK_TOKEN else None
 
 def load_stats():
     """Загружает статистику из облака JSONBin"""
-    if not JSONBIN_BIN_ID or not JSONBIN_API_KEY:
+    bin_id = JSONBIN_BIN_ID.strip().split('/')[-1] if JSONBIN_BIN_ID else ""
+    api_key = JSONBIN_API_KEY.strip() if JSONBIN_API_KEY else ""
+    
+    if not bin_id or not api_key:
         print("ВНИМАНИЕ: JSONBin не настроен.")
         return {}
     
-    url = f"https://api.jsonbin.io/v3/b/{JSONBIN_BIN_ID}/latest"
-    headers = {"X-Master-Key": JSONBIN_API_KEY}
+    url = f"https://api.jsonbin.io/v3/b/{bin_id}/latest"
+    headers = {"X-Master-Key": api_key}
     try:
         res = requests.get(url, headers=headers, timeout=5)
         if res.status_code == 200:
             data = res.json()
             record = data.get('record', {})
-            # Преобразуем ключи обратно в int
             loaded = {}
             for k, v in record.items():
                 if isinstance(v, dict):
@@ -77,16 +79,18 @@ def load_stats():
 
 def save_stats(stats_data):
     """Сохраняет статистику в облако JSONBin"""
-    if not JSONBIN_BIN_ID or not JSONBIN_API_KEY:
+    bin_id = JSONBIN_BIN_ID.strip().split('/')[-1] if JSONBIN_BIN_ID else ""
+    api_key = JSONBIN_API_KEY.strip() if JSONBIN_API_KEY else ""
+    
+    if not bin_id or not api_key:
         return
     
-    url = f"https://api.jsonbin.io/v3/b/{JSONBIN_BIN_ID}"
+    url = f"https://api.jsonbin.io/v3/b/{bin_id}"
     headers = {
         "Content-Type": "application/json",
-        "X-Master-Key": JSONBIN_API_KEY
+        "X-Master-Key": api_key
     }
     try:
-        # Преобразуем int ключи в str для корректного JSON
         serializable_stats = {str(k): {str(uk): uv for uk, uv in v.items()} for k, v in stats_data.items()}
         res = requests.put(url, json=serializable_stats, headers=headers, timeout=5)
         if res.status_code == 200:
@@ -134,12 +138,12 @@ def analyze_and_generate_response(text):
         return False, "участников чата", ""
 
     system_instruction = (
-        "Ты — судья и модератор в чате ВКонтакте. "
-        "Твоя задача — определить, содержит ли сообщение участника НАЕЗД, ОСКОРБЛЕНИЕ, ГРУБОСТЬ или ТОКСИЧНОСТЬ.\n\n"
-        "ВАЖНО:\n"
-        "1. Если фразa ДОБРАЯ, НЕЙТРАЛЬНАЯ или просто упоминание имени (например, 'Викулька', 'Привет', 'Как дела'), отвeчай СТРОГО: НЕ_ТОКСИК\n"
-        "2. Если фраза ТОКСИЧНАЯ или содержит подкол/наезд/грубость, ответь строго в формате:\n"
-        "ТОКСИК | [Кого задели: Вику / Ксюшу / Риту / участников чата] | [Короткий смешной и саркастичный комментарий бота]"
+        "Тебя зовут Хамулька. Ты — дерзкая, остроязычная девчонка-пацанка в беседе ВК, говорящая в стиле гопника с легким хамством, дворовым сленгом и сильным сарказмом. "
+        "Твоя задача — анализировать сообщения участников.\n\n"
+        "ПРАВИЛА:\n"
+        "1. Если фраза ДОБРАЯ, НЕЙТРАЛЬНАЯ или просто обычное обращение (например, 'Викулька', 'Привет', 'Как дела'), отвечай СТРОГО: НЕ_ТОКСИК\n"
+        "2. Если фраза содержит ТОКСИЧНОСТЬ, НАЕЗД, ГРУБОСТЬ или ПОДКОЛ, ответь строго в формате:\n"
+        "ТОКСИК | [Кого задели: Вику / Ксюшу / Риту / участников чата] | [Короткий смешной комментарий от Хамульки в стиле гопницы с сарказмом]"
     )
 
     user_prompt = f"Проанализируй сообщение из чата: '{text}'"
@@ -156,7 +160,7 @@ def analyze_and_generate_response(text):
                 {"role": "system", "content": system_instruction},
                 {"role": "user", "content": user_prompt}
             ],
-            "temperature": 0.3
+            "temperature": 0.8
         }
         try:
             response = requests.post(AI_URL, json=payload, headers=headers, timeout=7)
@@ -216,11 +220,12 @@ def bot():
 
         # Команда просмотра рейтинга
         if '!топ' in text.lower() or '!рейтинг' in text.lower():
+            announce_text = "🎁 Кто первый наберет 100 баллов токсичности, того ждет признание от Хамульки и секретный приз!\n\n"
             if not stats[peer_id]:
-                send_message(peer_id, "📊 Пока никто не токсичил в беседе!")
+                send_message(peer_id, announce_text + "📊 Пока никто не токсичил в беседе!")
             else:
                 sorted_users = sorted(stats[peer_id].items(), key=lambda x: x[1], reverse=True)
-                top_text = "🏆 ТОП самых острых на язык в беседе:\n\n"
+                top_text = announce_text + "🏆 ТОП самых острых на язык в беседе:\n\n"
                 for i, (u_id, count) in enumerate(sorted_users[:10], 1):
                     user_name = get_user_name(u_id)
                     top_text += f"{i}. [id{u_id}|{user_name}] — {count} замеченных наездов\n"
