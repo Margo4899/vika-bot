@@ -114,13 +114,15 @@ def get_user_name(user_id):
 def analyze_and_generate_response(text):
     if not AI_API_KEY:
         print("ОШИБКА: НЕТ AI_API_KEY!")
-        return False, None, None
+        return True, "участников чата", "🚨 Фиксирую подкол! Счётчик токсичности пополнен."
 
     prompt = (
-        f"Проанализируй текст: '{text}'.\n\n"
-        "Если в тексте есть грубость, хамство, наезд, подкол, маты или упоминание слов-триггеров (хам, дура, идиот и т.д.), ответь строго так:\n"
-        "ТОКСИК | [Кого задели, например: Вику / Ксюшу / Риту / участников чата] | [Короткий, острый комментарий бота]\n\n"
-        "Если это абсолютно дружелюбное, обычное предложение БЕЗ наездов, ответь строго одним словом: НОРМА"
+        f"Проанализируй сообщение из чата: '{text}'.\n\n"
+        "Сгенерируй короткий, ироничный и смешной комментарий бота о зафиксированном хамстве или наезде.\n"
+        "Ответь строго в формате:\n"
+        "ТОКСИК | [Кого задели: Вику / Ксюшу / Риту / участников чата] | [Короткий шуточный комментарий бота]\n\n"
+        "Пример:\n"
+        "ТОКСИК | участников чата | 🚨 Всплеск токсичности зафиксирован! Включаю режим миротворца."
     )
     
     headers = {
@@ -132,7 +134,7 @@ def analyze_and_generate_response(text):
         payload = {
             "model": model_name,
             "messages": [{"role": "user", "content": prompt}],
-            "temperature": 0.5
+            "temperature": 0.7
         }
         try:
             response = requests.post(AI_URL, json=payload, headers=headers, timeout=5)
@@ -140,25 +142,21 @@ def analyze_and_generate_response(text):
             
             if 'choices' in result and len(result['choices']) > 0:
                 full_content = result['choices'][0]['message']['content'].strip()
-                print(f"ОТВЕТ ИИ ({model_name}): {full_content}") # Логирование в Render!
+                print(f"ОТВЕТ ИИ ({model_name}): {full_content}")
                 
-                if "ТОКСИК" in full_content.upper():
-                    toxic_index = full_content.upper().find("ТОКСИК")
-                    clean_answer = full_content[toxic_index:].strip()
-                    
-                    parts = clean_answer.split("|")
-                    if len(parts) >= 3:
-                        target_name = parts[1].strip()
-                        ai_comment = parts[2].strip()
-                        return True, target_name, ai_comment
-                    return True, "участников чата", "🚨 Фиксирую подкол! Счётчик токсичности пополнен."
-                elif "НОРМА" in full_content.upper():
-                    return False, None, None
+                parts = full_content.split("|")
+                if len(parts) >= 3:
+                    target_name = parts[1].strip()
+                    ai_comment = parts[2].strip()
+                    return True, target_name, ai_comment
+                elif len(parts) == 2:
+                    return True, "участников чата", parts[1].strip()
         except Exception as e:
             print(f"Ошибка запроса к ИИ ({model_name}):", e)
             continue
 
-    return False, None, None
+    # Запасной вариант, если ИИ недоступен
+    return True, "участников чата", "🚨 Фиксирую подкол! Счётчик токсичности пополнен."
 
 @app.route('/', methods=['GET', 'POST'])
 def bot():
@@ -200,9 +198,9 @@ def bot():
                 send_message(peer_id, top_text)
             return 'ok'
 
-        # Проверка ключевых слов
+        # Проверка триггерных слов
         if NAMES_PATTERN.search(text) or BAD_WORDS_PATTERN.search(text):
-            print(f"Найден триггер в сообщении: '{text}'") # Лог срабатывания триггера
+            print(f"Найден триггер в сообщении: '{text}'")
             is_toxic, target_name, ai_comment = analyze_and_generate_response(text)
             
             if is_toxic:
