@@ -10,25 +10,24 @@ from phrases import NAMES_PATTERN
 
 app = Flask(__name__)
 
-# Переменные окружения
+# Переменные окружения из панелей типа Render
 VK_TOKEN = os.environ.get('VK_TOKEN', '')
-CONFIRMATION_CODE = os.environ.get('CONFIRMATION_CODE') or os.environ.get('CONFIRMATION_TOKEN', '')
-AI_API_KEY = os.environ.get('AI_API_KEY') or os.environ.get('GROQ_API_KEY', '') or os.environ.get('OPENROUTER_API_KEY', '')
-
-# Переменные для постоянного хранения через JSONBin
+CONFIRMATION_CODE = os.environ.get('CONFIRMATION_CODE', '')
+AI_API_KEY = os.environ.get('AI_API_KEY', '')
 JSONBIN_BIN_ID = os.environ.get('JSONBIN_BIN_ID', '')
 JSONBIN_API_KEY = os.environ.get('JSONBIN_API_KEY', '')
 
-# Запрошенный список моделей
+# Твой список моделей
 AI_MODELS = [
     'openai/gpt-oss-120b',
     'openai/gpt-oss-20b',
     'qwen/qwen3.8-27b',
     'qwen/qwen3.6-27b'
 ]
-AI_URL = os.environ.get('AI_URL', 'https://openrouter.ai/api/v1/chat/completions')
 
-# Список случайных реакций на случай временных сбоев API
+# Эндпоинт Groq API
+AI_URL = 'https://api.groq.com/openai/v1/chat/completions'
+
 FALLBACK_COMMENTS = [
     "🚨 Фиксирую подкол! Счётчик токсичности пополнен.",
     "⚠️ Ого, какая дерзость! Фиксируем наезд в базу.",
@@ -38,20 +37,12 @@ FALLBACK_COMMENTS = [
     "📉 Градус дружелюбия в беседе стремительно падает!"
 ]
 
-# Отрывки и корни хамских слов
 BAD_WORDS = [
-    # Хамство, наглость, дерзость
     r'хам', r'нахал', r'нагл', r'дерз', r'выпендр', r'понт',
-    
-    # Оскорбления, дурость, тупость
     r'дур', r'туп', r'идиот', r'клоун', r'твар', r'гнид', r'урод', r'мраз',
     r'придур', r'кончен', r'чушпан', r'бес', r'сволоч', r'шлюх', r'бред',
-    
-    # Наезды, эмоции, удивления/агрессия
     r'ахрин', r'охрин', r'афиг', r'офиг', r'ахуе', r'охуе',
-    
-    # Посылы и приказы
-    r'заткн', r'завал', r'закрой', r'пошел', r'пошла', r'соси', r'отвал',
+    r'заткн', r'завал', r'закрой', r'пошел', r me'пошла', r'соси', r'отвал',
     r'свал', r'исчез', r'съеб', r'оффн', r'пизд'
 ]
 BAD_WORDS_PATTERN = re.compile(r'|'.join(BAD_WORDS), re.IGNORECASE)
@@ -59,11 +50,8 @@ BAD_WORDS_PATTERN = re.compile(r'|'.join(BAD_WORDS), re.IGNORECASE)
 vk = vk_api.VkApi(token=VK_TOKEN) if VK_TOKEN else None
 
 def load_stats():
-    """Загружает статистику из облака JSONBin"""
     if not JSONBIN_BIN_ID or not JSONBIN_API_KEY:
-        print("ВНИМАНИЕ: Ключи JSONBin не настроены. Используется локальная память.")
         return {}
-    
     url = f"https://api.jsonbin.io/v3/b/{JSONBIN_BIN_ID}/latest"
     headers = {"X-Master-Key": JSONBIN_API_KEY}
     try:
@@ -72,14 +60,12 @@ def load_stats():
             record = res.json().get('record', {})
             return {int(k): {int(uk): uv for uk, uv in v.items()} for k, v in record.items()}
     except Exception as e:
-        print("Ошибка загрузки статистики из облака:", e)
+        print("Ошибка загрузки статистики:", e)
     return {}
 
 def save_stats(stats_data):
-    """Сохраняет статистику в облако JSONBin"""
     if not JSONBIN_BIN_ID or not JSONBIN_API_KEY:
         return
-    
     url = f"https://api.jsonbin.io/v3/b/{JSONBIN_BIN_ID}"
     headers = {
         "Content-Type": "application/json",
@@ -87,9 +73,8 @@ def save_stats(stats_data):
     }
     try:
         requests.put(url, json=stats_data, headers=headers, timeout=5)
-        print("Статистика успешно сохранена в облаке!")
     except Exception as e:
-        print("Ошибка сохранения статистики в облако:", e)
+        print("Ошибка сохранения статистики:", e)
 
 stats = load_stats()
 user_names_cache = {}
@@ -108,7 +93,6 @@ def send_message(peer_id, text):
 def get_user_name(user_id):
     if user_id in user_names_cache:
         return user_names_cache[user_id]
-    
     if vk:
         try:
             res = vk.method('users.get', {'user_ids': user_id})
@@ -120,13 +104,14 @@ def get_user_name(user_id):
                     user_names_cache[user_id] = full_name
                     return full_name
         except Exception as e:
-            print(f"Ошибка получения имени для id{user_id}:", e)
-            
+            print("Ошибка получения имени:", e)
     return "Участник"
 
 def analyze_and_generate_response(text):
-    if not AI_API_KEY:
-        print("ОШИБКА: НЕТ AI_API_KEY!")
+    # Очищаем ключ от скрытых символов и пробелов
+    clean_key = AI_API_KEY.strip() if AI_API_KEY else ""
+    if not clean_key:
+        print("ОШИБКА: AI_API_KEY пустой в Environment Variables!")
         return True, "участников чата", random.choice(FALLBACK_COMMENTS)
 
     system_instruction = (
@@ -139,14 +124,11 @@ def analyze_and_generate_response(text):
     user_prompt = (
         f"Участник написал сообщение: '{text}'.\n\n"
         "Сгенерируй реакцию строго в следующем формате:\n"
-        "ТОКСИК | [Кого задели: Вику / Ксюшу / Риту / участников чата] | [Короткий смешной комментарий бота без моралей и занудства]\n\n"
-        "Примеры ответов:\n"
-        "ТОКСИК | участников чата | 🚨 Уровень сарказма зашкаливает! Включаем систему охлаждения.\n"
-        "ТОКСИК | Вику | 🌶️ Кто-то сегодня явно не выспался и решает отыграться на Вике!"
+        "ТОКСИК | [Кого задели: Вику / Ксюшу / Риту / участников чата] | [Короткий смешной комментарий бота без моралей и занудства]"
     )
     
     headers = {
-        "Authorization": f"Bearer {AI_API_KEY}",
+        "Authorization": f"Bearer {clean_key}",
         "Content-Type": "application/json"
     }
 
@@ -160,33 +142,29 @@ def analyze_and_generate_response(text):
             "temperature": 0.7
         }
         try:
-            response = requests.post(AI_URL, json=payload, headers=headers, timeout=6)
+            response = requests.post(AI_URL, json=payload, headers=headers, timeout=7)
             result = response.json()
             
-            if 'choices' in result and len(result['choices']) > 0:
+            if response.status_code == 200 and 'choices' in result and len(result['choices']) > 0:
                 full_content = result['choices'][0]['message']['content'].strip()
-                # Удаляем теги мыслей, если модель их генерирует
                 full_content = re.sub(r'<think>.*?</think>', '', full_content, flags=re.DOTALL).strip()
                 
-                # Защита от стандартных отписок
                 lower_content = full_content.lower()
                 if "не могу" in lower_content or "как ии" in lower_content or "к сожалению" in lower_content:
-                    print(f"Модель {model_name} выдала отписку, пропуск...")
+                    print(f"Модель {model_name} выдала отписку, пробуем следующую...")
                     continue
 
                 print(f"УСПЕШНЫЙ ОТВЕТ ИИ ({model_name}): {full_content}")
                 
                 parts = full_content.split("|")
                 if len(parts) >= 3:
-                    target_name = parts[1].strip()
-                    ai_comment = parts[2].strip()
-                    return True, target_name, ai_comment
+                    return True, parts[1].strip(), parts[2].strip()
                 elif len(parts) == 2:
                     return True, "участников чата", parts[1].strip()
                 else:
                     return True, "участников чата", full_content
             else:
-                print(f"Сбой ИИ ({model_name}): {result}")
+                print(f"Сбой ИИ ({model_name}) [{response.status_code}]: {result}")
         except Exception as e:
             print(f"Ошибка запроса к ИИ ({model_name}):", e)
             continue
@@ -233,9 +211,7 @@ def bot():
                 send_message(peer_id, top_text)
             return 'ok'
 
-        # Проверка триггерных слов
         if NAMES_PATTERN.search(text) or BAD_WORDS_PATTERN.search(text):
-            print(f"Найден триггер в сообщении: '{text}'")
             is_toxic, target_name, ai_comment = analyze_and_generate_response(text)
             
             if is_toxic:
