@@ -1,6 +1,7 @@
 import os
 import re
 import json
+import random
 import requests
 from flask import Flask, request
 import vk_api
@@ -18,14 +19,26 @@ AI_API_KEY = os.environ.get('AI_API_KEY') or os.environ.get('GROQ_API_KEY', '')
 JSONBIN_BIN_ID = os.environ.get('JSONBIN_BIN_ID', '')
 JSONBIN_API_KEY = os.environ.get('JSONBIN_API_KEY', '')
 
+# Модели НЕ Llama на платформе Groq (Gemma, DeepSeek Distill, Qwen, Mixtral)
 AI_MODELS = [
-    'llama-3.3-70b-versatile',
-    'llama3-70b-8192',
-    'mixtral-8x7b-32768'
+    'gemma2-9b-it',
+    'deepseek-r1-distill-llama-70b',
+    'mixtral-8x7b-32768',
+    'qwen-2.5-32b'
 ]
 AI_URL = 'https://api.groq.com/openai/v1/chat/completions'
 
-# Отрывки и корни слов
+# Список случайных реакций на случай временных сбоев API
+FALLBACK_COMMENTS = [
+    "🚨 Фиксирую подкол! Счётчик токсичности пополнен.",
+    "⚠️ Ого, какая дерзость! Фиксируем наезд в базу.",
+    "🛡️ Система обнаружения хамства зафиксировала всплеск эмоций!",
+    "🌶️ Было остро, но наш счётчик всё запишет!",
+    "👀 Внимание! Замечен несанкционированный наезд.",
+    "📉 Градус дружелюбия в беседе стремительно падает!"
+]
+
+# Отрывки и корни хамских слов
 BAD_WORDS = [
     # Хамство, наглость, дерзость
     r'хам', r'нахал', r'нагл', r'дерз', r'выпендр', r'понт',
@@ -114,15 +127,15 @@ def get_user_name(user_id):
 def analyze_and_generate_response(text):
     if not AI_API_KEY:
         print("ОШИБКА: НЕТ AI_API_KEY!")
-        return True, "участников чата", "🚨 Фиксирую подкол! Счётчик токсичности пополнен."
+        return True, "участников чата", random.choice(FALLBACK_COMMENTS)
 
     prompt = (
-        f"Проанализируй сообщение из чата: '{text}'.\n\n"
-        "Сгенерируй короткий, ироничный и смешной комментарий бота о зафиксированном хамстве или наезде.\n"
+        f"Проанализируй фразу из чата: '{text}'.\n\n"
+        "Сгенерируй короткую, смешную, ироничную и остроумную реакцию бота на этот подкол или хамство.\n"
         "Ответь строго в формате:\n"
-        "ТОКСИК | [Кого задели: Вику / Ксюшу / Риту / участников чата] | [Короткий шуточный комментарий бота]\n\n"
+        "ТОКСИК | [Кого задели: Вику / Ксюшу / Риту / участников чата] | [Остроумный комментарий бота]\n\n"
         "Пример:\n"
-        "ТОКСИК | участников чата | 🚨 Всплеск токсичности зафиксирован! Включаю режим миротворца."
+        "ТОКСИК | участников чата | 🚨 Всплеск сарказма зафиксирован! Включаю режим охлаждения."
     )
     
     headers = {
@@ -134,15 +147,18 @@ def analyze_and_generate_response(text):
         payload = {
             "model": model_name,
             "messages": [{"role": "user", "content": prompt}],
-            "temperature": 0.7
+            "temperature": 0.8
         }
         try:
-            response = requests.post(AI_URL, json=payload, headers=headers, timeout=5)
+            response = requests.post(AI_URL, json=payload, headers=headers, timeout=6)
             result = response.json()
             
             if 'choices' in result and len(result['choices']) > 0:
                 full_content = result['choices'][0]['message']['content'].strip()
-                print(f"ОТВЕТ ИИ ({model_name}): {full_content}")
+                # Если DeepSeek возвращает размышления в тегах <think>, вырезаем их
+                full_content = re.sub(r'<think>.*?</think>', '', full_content, flags=re.DOTALL).strip()
+                
+                print(f"УСПЕШНЫЙ ОТВЕТ ИИ ({model_name}): {full_content}")
                 
                 parts = full_content.split("|")
                 if len(parts) >= 3:
@@ -151,12 +167,15 @@ def analyze_and_generate_response(text):
                     return True, target_name, ai_comment
                 elif len(parts) == 2:
                     return True, "участников чата", parts[1].strip()
+                else:
+                    return True, "участников чата", full_content
+            else:
+                print(f"Сбой Groq ({model_name}): {result}")
         except Exception as e:
-            print(f"Ошибка запроса к ИИ ({model_name}):", e)
+            print(f"Ошибка запроса к Groq ({model_name}):", e)
             continue
 
-    # Запасной вариант, если ИИ недоступен
-    return True, "участников чата", "🚨 Фиксирую подкол! Счётчик токсичности пополнен."
+    return True, "участников чата", random.choice(FALLBACK_COMMENTS)
 
 @app.route('/', methods=['GET', 'POST'])
 def bot():
