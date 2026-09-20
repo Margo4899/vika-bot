@@ -13,20 +13,20 @@ app = Flask(__name__)
 # Переменные окружения
 VK_TOKEN = os.environ.get('VK_TOKEN', '')
 CONFIRMATION_CODE = os.environ.get('CONFIRMATION_CODE') or os.environ.get('CONFIRMATION_TOKEN', '')
-AI_API_KEY = os.environ.get('AI_API_KEY') or os.environ.get('GROQ_API_KEY', '')
+AI_API_KEY = os.environ.get('AI_API_KEY') or os.environ.get('GROQ_API_KEY', '') or os.environ.get('OPENROUTER_API_KEY', '')
 
 # Переменные для постоянного хранения через JSONBin
 JSONBIN_BIN_ID = os.environ.get('JSONBIN_BIN_ID', '')
 JSONBIN_API_KEY = os.environ.get('JSONBIN_API_KEY', '')
 
-# Модели НЕ Llama на платформе Groq (Gemma, DeepSeek Distill, Qwen, Mixtral)
+# Запрошенный список моделей
 AI_MODELS = [
     'openai/gpt-oss-120b',
     'openai/gpt-oss-20b',
     'qwen/qwen3.8-27b',
     'qwen/qwen3.6-27b'
 ]
-AI_URL = 'https://api.groq.com/openai/v1/chat/completions'
+AI_URL = os.environ.get('AI_URL', 'https://openrouter.ai/api/v1/chat/completions')
 
 # Список случайных реакций на случай временных сбоев API
 FALLBACK_COMMENTS = [
@@ -129,13 +129,20 @@ def analyze_and_generate_response(text):
         print("ОШИБКА: НЕТ AI_API_KEY!")
         return True, "участников чата", random.choice(FALLBACK_COMMENTS)
 
-    prompt = (
-        f"Проанализируй фразу из чата: '{text}'.\n\n"
-        "Сгенерируй короткую, смешную, ироничную и остроумную реакцию бота на этот подкол или хамство.\n"
-        "Ответь строго в формате:\n"
-        "ТОКСИК | [Кого задели: Вику / Ксюшу / Риту / участников чата] | [Остроумный комментарий бота]\n\n"
-        "Пример:\n"
-        "ТОКСИК | участников чата | 🚨 Всплеск сарказма зафиксирован! Включаю режим охлаждения."
+    system_instruction = (
+        "Ты — саркастичный и ироничный бот-судья в молодежном чате ВКонтакте. "
+        "Твоя единственная задача — коротко, остроумно и смешно прокомментировать подкол, грубость или наезд от участника чата. "
+        "СТРОГО ЗАПРЕЩЕНО писать отказы вроде 'Я не могу с этим помочь', 'Я не поддерживаю грубость', морализаторские лекции или абстрактный бред. "
+        "Всегда сохраняй игровой контекст и ролевую игру бота!"
+    )
+
+    user_prompt = (
+        f"Участник написал сообщение: '{text}'.\n\n"
+        "Сгенерируй реакцию строго в следующем формате:\n"
+        "ТОКСИК | [Кого задели: Вику / Ксюшу / Риту / участников чата] | [Короткий смешной комментарий бота без моралей и занудства]\n\n"
+        "Примеры ответов:\n"
+        "ТОКСИК | участников чата | 🚨 Уровень сарказма зашкаливает! Включаем систему охлаждения.\n"
+        "ТОКСИК | Вику | 🌶️ Кто-то сегодня явно не выспался и решает отыграться на Вике!"
     )
     
     headers = {
@@ -146,8 +153,11 @@ def analyze_and_generate_response(text):
     for model_name in AI_MODELS:
         payload = {
             "model": model_name,
-            "messages": [{"role": "user", "content": prompt}],
-            "temperature": 0.8
+            "messages": [
+                {"role": "system", "content": system_instruction},
+                {"role": "user", "content": user_prompt}
+            ],
+            "temperature": 0.7
         }
         try:
             response = requests.post(AI_URL, json=payload, headers=headers, timeout=6)
@@ -155,9 +165,15 @@ def analyze_and_generate_response(text):
             
             if 'choices' in result and len(result['choices']) > 0:
                 full_content = result['choices'][0]['message']['content'].strip()
-                # Если DeepSeek возвращает размышления в тегах <think>, вырезаем их
+                # Удаляем теги мыслей, если модель их генерирует
                 full_content = re.sub(r'<think>.*?</think>', '', full_content, flags=re.DOTALL).strip()
                 
+                # Защита от стандартных отписок
+                lower_content = full_content.lower()
+                if "не могу" in lower_content or "как ии" in lower_content or "к сожалению" in lower_content:
+                    print(f"Модель {model_name} выдала отписку, пропуск...")
+                    continue
+
                 print(f"УСПЕШНЫЙ ОТВЕТ ИИ ({model_name}): {full_content}")
                 
                 parts = full_content.split("|")
@@ -170,9 +186,9 @@ def analyze_and_generate_response(text):
                 else:
                     return True, "участников чата", full_content
             else:
-                print(f"Сбой Groq ({model_name}): {result}")
+                print(f"Сбой ИИ ({model_name}): {result}")
         except Exception as e:
-            print(f"Ошибка запроса к Groq ({model_name}):", e)
+            print(f"Ошибка запроса к ИИ ({model_name}):", e)
             continue
 
     return True, "участников чата", random.choice(FALLBACK_COMMENTS)
