@@ -21,10 +21,10 @@ JSONBIN_API_KEY = os.environ.get('JSONBIN_API_KEY', '')
 
 # Модели НЕ Llama на платформе Groq (Gemma, DeepSeek Distill, Qwen, Mixtral)
 AI_MODELS = [
-    'gemma2-9b-it',
-    'deepseek-r1-distill-llama-70b',
-    'mixtral-8x7b-32768',
-    'qwen-2.5-32b'
+    'openai/gpt-oss-120b',
+    'openai/gpt-oss-20b',
+    'qwen/qwen3.8-27b',
+    'qwen/qwen3.6-27b'
 ]
 AI_URL = 'https://api.groq.com/openai/v1/chat/completions'
 
