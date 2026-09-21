@@ -49,8 +49,12 @@ BAD_WORDS_PATTERN = re.compile(r'|'.join(BAD_WORDS), re.IGNORECASE)
 
 vk = vk_api.VkApi(token=VK_TOKEN) if VK_TOKEN else None
 
+# Флаг корректной загрузки базы из облака
+is_storage_synced = False
+
 def load_stats():
     """Загружает статистику из облака JSONBin"""
+    global is_storage_synced
     bin_id = JSONBIN_BIN_ID.strip().split('/')[-1] if JSONBIN_BIN_ID else ""
     api_key = JSONBIN_API_KEY.strip() if JSONBIN_API_KEY else ""
     
@@ -61,7 +65,7 @@ def load_stats():
     url = f"https://api.jsonbin.io/v3/b/{bin_id}/latest"
     headers = {"X-Master-Key": api_key}
     try:
-        res = requests.get(url, headers=headers, timeout=5)
+        res = requests.get(url, headers=headers, timeout=7)
         if res.status_code == 200:
             data = res.json()
             record = data.get('record', {})
@@ -70,6 +74,7 @@ def load_stats():
                 if isinstance(v, dict):
                     loaded[int(k)] = {int(uk): int(uv) for uk, uv in v.items()}
             print("Статистика успешно загружена из облака!")
+            is_storage_synced = True
             return loaded
         else:
             print(f"Ошибка загрузки JSONBin [{res.status_code}]: {res.text}")
@@ -79,12 +84,18 @@ def load_stats():
 
 def save_stats(stats_data):
     """Сохраняет статистику в облако JSONBin"""
+    global is_storage_synced
     bin_id = JSONBIN_BIN_ID.strip().split('/')[-1] if JSONBIN_BIN_ID else ""
     api_key = JSONBIN_API_KEY.strip() if JSONBIN_API_KEY else ""
     
     if not bin_id or not api_key:
         return
-    
+
+    # Защита: если загрузка ранее провалилась и база пустая, не затираем облако
+    if not is_storage_synced and not stats_data:
+        print("Предупреждение: Пропуск сохранения, облачная база не была синхронизирована!")
+        return
+
     url = f"https://api.jsonbin.io/v3/b/{bin_id}"
     headers = {
         "Content-Type": "application/json",
@@ -92,9 +103,10 @@ def save_stats(stats_data):
     }
     try:
         serializable_stats = {str(k): {str(uk): uv for uk, uv in v.items()} for k, v in stats_data.items()}
-        res = requests.put(url, json=serializable_stats, headers=headers, timeout=5)
+        res = requests.put(url, json=serializable_stats, headers=headers, timeout=7)
         if res.status_code == 200:
             print("Статистика успешно сохранена в облаке!")
+            is_storage_synced = True
         else:
             print(f"Ошибка сохранения JSONBin [{res.status_code}]: {res.text}")
     except Exception as e:
@@ -141,7 +153,7 @@ def analyze_and_generate_response(text):
         "Тебя зовут Хамулька. Ты — дерзкая девчонка-пацанка в беседе ВК, отвечающая в стиле гопницы с легким дворовым сленгом, сарказмом и дерзостью.\n\n"
         "Твоя задача — жестко фиксировать ЛЮБУЮ токсичность, даже самую легкую!\n\n"
         "КРИТЕРИИ:\n"
-        "1. Засчитывай как ТОКСИК любая грубость, обзывательства (даже легкие: 'хам', 'выпендрежник', 'душнила', 'клоун'), сарказм, подколы, претензии или наезды.\n"
+        "1. Засчитывай как ТОКСИК любую грубость, обзывательства (даже легкие: 'хам', 'выпендрежник', 'душнила', 'клоун'), сарказм, подколы, претензии или наезды.\n"
         "2. Отвечай НЕ_ТОКСИК ТОЛЬКО если фраза полностью добрая, вежливая, нейтральная (например: 'Привет', 'Доброе утро', 'Спасибо', 'Как дела?') или просто ласковое/обычное имя без намека на наезд.\n\n"
         "ФОРМАТ ОТВЕТА ПРИ ТОКСИЧНОСТИ:\n"
         "ТОКСИК | [Кого задели: Вику / Ксюшу / Риту / участников чата] | [Короткий смешной комментарий от Хамульки в стиле гопницы с сарказмом]"
@@ -193,6 +205,7 @@ def analyze_and_generate_response(text):
 
 @app.route('/', methods=['GET', 'POST'])
 def bot():
+    global stats, is_storage_synced
     if request.method == 'GET':
         return 'Bot is running alive!', 200
 
@@ -216,6 +229,10 @@ def bot():
         if not peer_id or not from_id:
             return 'ok'
 
+        # Если база еще не была загружена из облака, пробуем подгрузить
+        if not is_storage_synced:
+            stats = load_stats()
+
         if peer_id not in stats:
             stats[peer_id] = {}
 
@@ -237,7 +254,6 @@ def bot():
         if NAMES_PATTERN.search(text) or BAD_WORDS_PATTERN.search(text):
             is_toxic, target_name, ai_comment = analyze_and_generate_response(text)
             
-            # Начисляем баллы ТОЛЬКО если ИИ подтвердил токсичность
             if is_toxic:
                 stats[peer_id][from_id] = stats[peer_id].get(from_id, 0) + 1
                 save_stats(stats)
