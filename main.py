@@ -3,6 +3,7 @@ import re
 import json
 import random
 import requests
+import threading
 from flask import Flask, request
 import vk_api
 
@@ -17,7 +18,7 @@ AI_API_KEY = os.environ.get('AI_API_KEY', '')
 JSONBIN_BIN_ID = os.environ.get('JSONBIN_BIN_ID', '')
 JSONBIN_API_KEY = os.environ.get('JSONBIN_API_KEY', '')
 
-# Твой список моделей
+# Список моделей
 AI_MODELS = [
     'openai/gpt-oss-120b',
     'openai/gpt-oss-20b',
@@ -25,7 +26,6 @@ AI_MODELS = [
     'qwen/qwen3.6-27b'
 ]
 
-# Эндпоинт Groq API
 AI_URL = 'https://api.groq.com/openai/v1/chat/completions'
 
 FALLBACK_COMMENTS = [
@@ -42,19 +42,19 @@ BAD_WORDS = [
     r'дур', r'туп', r'идиот', r'клоун', r'твар', r'гнид', r'урод', r'мраз',
     r'придур', r'кончен', r'чушпан', r'бес', r'сволоч', r'шлюх', r'бред',
     r'ахрин', r'охрин', r'афиг', r'офиг', r'ахуе', r'охуе',
-    r'заткн', r'завал', r'закрой', r'пошел', r'пошла', r'соси', r'отвал',
+    r'заткн', r'завал', r'закрой', r'пошел', r'пошла', r'соси', r me'отвал',
     r'свал', r'исчез', r'съеб', r'оффн', r'пизд'
 ]
 BAD_WORDS_PATTERN = re.compile(r'|'.join(BAD_WORDS), re.IGNORECASE)
 
 vk = vk_api.VkApi(token=VK_TOKEN) if VK_TOKEN else None
 
-# Флаг корректной загрузки базы из облака
-is_storage_synced = False
+# Защита от повторной обработки дубликатов сообщений
+processed_msg_ids = set()
+stats_lock = threading.Lock()
 
 def load_stats():
     """Загружает статистику из облака JSONBin"""
-    global is_storage_synced
     bin_id = JSONBIN_BIN_ID.strip().split('/')[-1] if JSONBIN_BIN_ID else ""
     api_key = JSONBIN_API_KEY.strip() if JSONBIN_API_KEY else ""
     
@@ -65,7 +65,7 @@ def load_stats():
     url = f"https://api.jsonbin.io/v3/b/{bin_id}/latest"
     headers = {"X-Master-Key": api_key}
     try:
-        res = requests.get(url, headers=headers, timeout=7)
+        res = requests.get(url, headers=headers, timeout=10)
         if res.status_code == 200:
             data = res.json()
             record = data.get('record', {})
@@ -74,7 +74,6 @@ def load_stats():
                 if isinstance(v, dict):
                     loaded[int(k)] = {int(uk): int(uv) for uk, uv in v.items()}
             print("Статистика успешно загружена из облака!")
-            is_storage_synced = True
             return loaded
         else:
             print(f"Ошибка загрузки JSONBin [{res.status_code}]: {res.text}")
@@ -84,16 +83,10 @@ def load_stats():
 
 def save_stats(stats_data):
     """Сохраняет статистику в облако JSONBin"""
-    global is_storage_synced
     bin_id = JSONBIN_BIN_ID.strip().split('/')[-1] if JSONBIN_BIN_ID else ""
     api_key = JSONBIN_API_KEY.strip() if JSONBIN_API_KEY else ""
     
-    if not bin_id or not api_key:
-        return
-
-    # Защита: если загрузка ранее провалилась и база пустая, не затираем облако
-    if not is_storage_synced and not stats_data:
-        print("Предупреждение: Пропуск сохранения, облачная база не была синхронизирована!")
+    if not bin_id or not api_key or not stats_data:
         return
 
     url = f"https://api.jsonbin.io/v3/b/{bin_id}"
@@ -103,15 +96,15 @@ def save_stats(stats_data):
     }
     try:
         serializable_stats = {str(k): {str(uk): uv for uk, uv in v.items()} for k, v in stats_data.items()}
-        res = requests.put(url, json=serializable_stats, headers=headers, timeout=7)
+        res = requests.put(url, json=serializable_stats, headers=headers, timeout=10)
         if res.status_code == 200:
             print("Статистика успешно сохранена в облаке!")
-            is_storage_synced = True
         else:
             print(f"Ошибка сохранения JSONBin [{res.status_code}]: {res.text}")
     except Exception as e:
         print("Ошибка сохранения статистики:", e)
 
+# Первичная загрузка при старте
 stats = load_stats()
 user_names_cache = {}
 
@@ -146,7 +139,6 @@ def get_user_name(user_id):
 def analyze_and_generate_response(text):
     clean_key = AI_API_KEY.strip() if AI_API_KEY else ""
     if not clean_key:
-        print("ОШИБКА: AI_API_KEY пустой!")
         return False, "участников чата", ""
 
     system_instruction = (
@@ -160,11 +152,7 @@ def analyze_and_generate_response(text):
     )
 
     user_prompt = f"Проанализируй сообщение из чата: '{text}'"
-    
-    headers = {
-        "Authorization": f"Bearer {clean_key}",
-        "Content-Type": "application/json"
-    }
+    headers = {"Authorization": f"Bearer {clean_key}", "Content-Type": "application/json"}
 
     for model_name in AI_MODELS:
         payload = {
@@ -176,14 +164,12 @@ def analyze_and_generate_response(text):
             "temperature": 0.7
         }
         try:
-            response = requests.post(AI_URL, json=payload, headers=headers, timeout=7)
+            response = requests.post(AI_URL, json=payload, headers=headers, timeout=8)
             result = response.json()
             
             if response.status_code == 200 and 'choices' in result and len(result['choices']) > 0:
                 full_content = result['choices'][0]['message']['content'].strip()
                 full_content = re.sub(r'<think>.*?</think>', '', full_content, flags=re.DOTALL).strip()
-                
-                print(f"ОТВЕТ ИИ ({model_name}): {full_content}")
 
                 if "НЕ_ТОКСИК" in full_content or "НЕ ТОКСИК" in full_content:
                     return False, "участников чата", ""
@@ -195,17 +181,59 @@ def analyze_and_generate_response(text):
                     return True, "участников чата", parts[1].strip()
                 else:
                     return True, "участников чата", random.choice(FALLBACK_COMMENTS)
-            else:
-                print(f"Сбой ИИ ({model_name}) [{response.status_code}]: {result}")
         except Exception as e:
-            print(f"Ошибка запроса к ИИ ({model_name}):", e)
             continue
 
     return False, "участников чата", ""
 
+def process_message_async(text, peer_id, from_id):
+    """Асинхронная фоновая обработка сообщений без задержек для ВК"""
+    global stats
+    
+    # Если база пустая, пробуем подгрузить перед изменением
+    with stats_lock:
+        if not stats:
+            stats = load_stats()
+
+        if peer_id not in stats:
+            stats[peer_id] = {}
+
+    # Обработка команды !топ
+    if '!топ' in text.lower() or '!рейтинг' in text.lower():
+        announce_text = "🎁 Кто первый наберет 100 баллов токсичности, того ждет признание от Хамульки и секретный приз!\n\n"
+        with stats_lock:
+            chat_stats = stats.get(peer_id, {})
+        if not chat_stats:
+            send_message(peer_id, announce_text + "📊 Пока никто не токсичил в беседе!")
+        else:
+            sorted_users = sorted(chat_stats.items(), key=lambda x: x[1], reverse=True)
+            top_text = announce_text + "🏆 ТОП самых острых на язык в беседе:\n\n"
+            for i, (u_id, count) in enumerate(sorted_users[:10], 1):
+                user_name = get_user_name(u_id)
+                top_text += f"{i}. [id{u_id}|{user_name}] — {count} замеченных наездов\n"
+            send_message(peer_id, top_text)
+        return
+
+    # Проверка на токсичность
+    if NAMES_PATTERN.search(text) or BAD_WORDS_PATTERN.search(text):
+        is_toxic, target_name, ai_comment = analyze_and_generate_response(text)
+        
+        if is_toxic:
+            with stats_lock:
+                stats[peer_id][from_id] = stats[peer_id].get(from_id, 0) + 1
+                user_count = stats[peer_id][from_id]
+                save_stats(stats)
+            
+            user_name = get_user_name(from_id)
+            reply = (
+                f"{ai_comment}\n\n"
+                f"🛡️ Фиксация: [id{from_id}|{user_name}], зафиксирован наезд на {target_name}!\n"
+                f"📈 Ваша статистика в банке токсичности: {user_count}"
+            )
+            send_message(peer_id, reply)
+
 @app.route('/', methods=['GET', 'POST'])
 def bot():
-    global stats, is_storage_synced
     if request.method == 'GET':
         return 'Bot is running alive!', 200
 
@@ -222,52 +250,24 @@ def bot():
         obj = data.get('object', {})
         message = obj.get('message', obj)
         
+        msg_id = message.get('id') or message.get('conversation_message_id')
         text = message.get('text', '')
         peer_id = message.get('peer_id')
         from_id = message.get('from_id')
         
-        if not peer_id or not from_id:
-            return 'ok'
+        # Дедупликация: если ВК прислал повтор того же сообщения, игнорируем
+        if msg_id:
+            if msg_id in processed_msg_ids:
+                return 'ok'
+            processed_msg_ids.add(msg_id)
+            if len(processed_msg_ids) > 1000:
+                processed_msg_ids.clear()
 
-        # Если база еще не была загружена из облака, пробуем подгрузить
-        if not is_storage_synced:
-            stats = load_stats()
-
-        if peer_id not in stats:
-            stats[peer_id] = {}
-
-        # Команда просмотра рейтинга
-        if '!топ' in text.lower() or '!рейтинг' in text.lower():
-            announce_text = "🎁 Кто первый наберет 100 баллов токсичности, того ждет признание от Хамульки и секретный приз!\n\n"
-            if not stats[peer_id]:
-                send_message(peer_id, announce_text + "📊 Пока никто не токсичил в беседе!")
-            else:
-                sorted_users = sorted(stats[peer_id].items(), key=lambda x: x[1], reverse=True)
-                top_text = announce_text + "🏆 ТОП самых острых на язык в беседе:\n\n"
-                for i, (u_id, count) in enumerate(sorted_users[:10], 1):
-                    user_name = get_user_name(u_id)
-                    top_text += f"{i}. [id{u_id}|{user_name}] — {count} замеченных наездов\n"
-                send_message(peer_id, top_text)
-            return 'ok'
-
-        # Проверяем ключевые слова
-        if NAMES_PATTERN.search(text) or BAD_WORDS_PATTERN.search(text):
-            is_toxic, target_name, ai_comment = analyze_and_generate_response(text)
+        if peer_id and from_id:
+            # Запускаем обработку в фоновом потоке
+            threading.Thread(target=process_message_async, args=(text, peer_id, from_id)).start()
             
-            if is_toxic:
-                stats[peer_id][from_id] = stats[peer_id].get(from_id, 0) + 1
-                save_stats(stats)
-                
-                user_count = stats[peer_id][from_id]
-                user_name = get_user_name(from_id)
-                
-                reply = (
-                    f"{ai_comment}\n\n"
-                    f"🛡️ Фиксация: [id{from_id}|{user_name}], зафиксирован наезд на {target_name}!\n"
-                    f"📈 Ваша статистика в банке токсичности: {user_count}"
-                )
-                send_message(peer_id, reply)
-            
+        # Мгновенно отвечаем ВК "ok", чтобы он НЕ дублировал запросы
         return 'ok'
 
     return 'ok'
