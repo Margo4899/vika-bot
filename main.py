@@ -51,7 +51,7 @@ processed_msg_ids = set()
 user_names_cache = {}
 
 def get_db_connection():
-    """Подключение к Supabase PostgreSQL с выводом ошибок"""
+    """Подключение к Supabase PostgreSQL с поддержкой SSL"""
     if not DATABASE_URL:
         print("❌ [БД] ОШИБКА: Переменная DATABASE_URL пустая или не найдена в Render!")
         return None
@@ -63,40 +63,45 @@ def get_db_connection():
         return None
 
 def add_toxicity_point(peer_id, user_id):
-    """Атомарное добавление +1 балла с детальным логированием"""
-    print(f"🔄 [БД] Попытка добавить балл для peer_id={peer_id}, user_id={user_id}...")
+    """Гарантированное добавление +1 балла и получение актуального счета"""
+    print(f"🔄 [БД] Обновляем балл: peer_id={peer_id}, user_id={user_id}")
     conn = get_db_connection()
     if not conn:
-        print("❌ [БД] Отмена операции: нет соединения с базами данных.")
+        print("❌ [БД] Отмена операции: нет соединения с базой данных.")
         return 0
+    
     try:
         with conn.cursor() as cur:
+            # 1. Вставляем новую запись или прибавляем +1
             cur.execute("""
                 INSERT INTO toxicity_stats (peer_id, user_id, score)
                 VALUES (%s, %s, 1)
                 ON CONFLICT (peer_id, user_id)
-                DO UPDATE SET score = toxicity_stats.score + 1
-                RETURNING score;
+                DO UPDATE SET score = toxicity_stats.score + 1;
             """, (peer_id, user_id))
+            conn.commit()
+
+            # 2. Явно читаем итоговое значение
+            cur.execute("""
+                SELECT score FROM toxicity_stats
+                WHERE peer_id = %s AND user_id = %s;
+            """, (peer_id, user_id))
+            row = cur.fetchone()
             
-            result = cur.fetchone()
-            if result:
-                new_score = result[0]
-                conn.commit()
-                print(f"✅ [БД] Успешно! Новый счёт пользователя {user_id}: {new_score}")
-                return new_score
-            else:
-                print("⚠️ [БД] Запрос выполнился, но RETURNING score вернул None")
-                return 0
+            if row:
+                current_score = row[0]
+                print(f"✅ [БД] Зафиксировано! Текущий счет пользователя {user_id}: {current_score}")
+                return current_score
+            return 0
     except Exception as e:
-        print(f"❌ [БД] Исключение при выполнении SQL-запроса: {e}")
+        print(f"❌ [БД] Ошибка работы с базой: {e}")
         conn.rollback()
         return 0
     finally:
         conn.close()
 
 def get_top_users(peer_id):
-    """Получение Топ-10 пользователей с логами"""
+    """Получение Топ-10 пользователей беседы"""
     print(f"🔄 [БД] Запрос ТОПа для peer_id={peer_id}...")
     conn = get_db_connection()
     if not conn:
@@ -149,21 +154,21 @@ def get_user_name(user_id):
 
 def analyze_and_generate_response(text):
     clean_key = AI_API_KEY.strip() if AI_API_KEY else ""
+    
     if not clean_key:
-        print("⚠️ [ИИ] AI_API_KEY отсутствует, пропуск анализа ИИ")
-        return False, "участников чата", ""
+        print("⚠️ [ИИ] Ключ AI_API_KEY не задан, срабатывает резервный ответ")
+        return True, "участников чата", random.choice(FALLBACK_COMMENTS)
 
     system_instruction = (
-        "Тебя зовут Хамулька. Ты — дерзкая девчонка-пацанка в беседе ВК, отвечающая в стиле гопницы с легким дворовым сленгом, сарказмом и дерзостью.\n\n"
-        "Твоя задача — жестко фиксировать ЛЮБУЮ токсичность, даже самую легкую!\n\n"
-        "КРИТЕРИИ:\n"
-        "1. Засчитывай как ТОКСИК любую грубость, обзывательства (даже легкие: 'хам', 'выпендрежник', 'душнила', 'клоун'), сарказм, подколы, претензии или наезды.\n"
-        "2. Отвечай НЕ_ТОКСИК ТОЛЬКО если фраза полностью добрая, вежливая, нейтральная (например: 'Привет', 'Доброе утро', 'Спасибо', 'Как дела?') или просто ласковое/обычное имя без намека на наезд.\n\n"
-        "ФОРМАТ ОТВЕТА ПРИ ТОКСИЧНОСТИ:\n"
-        "ТОКСИК | [Кого задели: Вику / Ксюшу / Риту / участников чата] | [Короткий смешной комментарий от Хамульки в стиле гопницы с сарказмом]"
+        "Ты — Хамулька, дерзкая девчонка-гопница из дворового чата. "
+        "Твоя задача — строго фиксировать ЛЮБЫЕ наезды, мат, обозвания и подколы.\n"
+        "Слова типа 'дура', 'тупой', 'клоун', 'хам', 'гнида' — это 100% ТОКСИК!\n\n"
+        "ОТВЕЧАЙ СТРОГО В ФОРМАТЕ:\n"
+        "ТОКСИК | [Имя кого задели или 'участников чата'] | [Короткий дерзкий ответ от Хамульки]\n\n"
+        "Если фраза абсолютно добрая ('привет', 'спасибо'), отвечай: НЕ_ТОКСИК"
     )
 
-    user_prompt = f"Проанализируй сообщение из чата: '{text}'"
+    user_prompt = f"Проанализируй фразу из чата: '{text}'"
     headers = {"Authorization": f"Bearer {clean_key}", "Content-Type": "application/json"}
 
     for model_name in AI_MODELS:
@@ -173,31 +178,34 @@ def analyze_and_generate_response(text):
                 {"role": "system", "content": system_instruction},
                 {"role": "user", "content": user_prompt}
             ],
-            "temperature": 0.7
+            "temperature": 0.5
         }
         try:
-            response = requests.post(AI_URL, json=payload, headers=headers, timeout=8)
-            result = response.json()
-            
-            if response.status_code == 200 and 'choices' in result and len(result['choices']) > 0:
-                full_content = result['choices'][0]['message']['content'].strip()
-                full_content = re.sub(r'<think>.*?</think>', '', full_content, flags=re.DOTALL).strip()
+            response = requests.post(AI_URL, json=payload, headers=headers, timeout=5)
+            if response.status_code == 200:
+                result = response.json()
+                if 'choices' in result and len(result['choices']) > 0:
+                    full_content = result['choices'][0]['message']['content'].strip()
+                    full_content = re.sub(r'<think>.*?</think>', '', full_content, flags=re.DOTALL).strip()
+                    
+                    print(f"🤖 [ИИ Ответ {model_name}]: {full_content}")
 
-                if "НЕ_ТОКСИК" in full_content or "НЕ ТОКСИК" in full_content:
-                    return False, "участников чата", ""
-                
-                parts = full_content.split("|")
-                if len(parts) >= 3:
-                    return True, parts[1].strip(), parts[2].strip()
-                elif len(parts) == 2:
-                    return True, "участников чата", parts[1].strip()
-                else:
-                    return True, "участников чата", random.choice(FALLBACK_COMMENTS)
+                    if "НЕ_ТОКСИК" in full_content or "НЕ ТОКСИК" in full_content:
+                        return False, "участников чата", ""
+                    
+                    parts = full_content.split("|")
+                    if len(parts) >= 3:
+                        return True, parts[1].strip(), parts[2].strip()
+                    elif len(parts) == 2:
+                        return True, "участников чата", parts[1].strip()
+                    else:
+                        return True, "участников чата", random.choice(FALLBACK_COMMENTS)
         except Exception as e:
             print(f"⚠️ [ИИ] Ошибка модели {model_name}: {e}")
             continue
 
-    return False, "участников чата", ""
+    print("⚠️ [ИИ] Модели затаймаутили, засчитываем ТОКСИК по ключевому слову")
+    return True, "участников чата", random.choice(FALLBACK_COMMENTS)
 
 def process_message_async(text, peer_id, from_id):
     # Команда рейтинга
