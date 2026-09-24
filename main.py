@@ -51,9 +51,9 @@ processed_msg_ids = set()
 user_names_cache = {}
 
 def get_db_connection():
-    """Подключение к Supabase PostgreSQL с поддержкой SSL"""
+    """Подключение к Supabase PostgreSQL"""
     if not DATABASE_URL:
-        print("❌ [БД] ОШИБКА: Переменная DATABASE_URL пустая или не найдена в Render!")
+        print("❌ [БД] ОШИБКА: Переменная DATABASE_URL не найдена в Render!")
         return None
     try:
         conn = psycopg2.connect(DATABASE_URL, sslmode='require')
@@ -63,7 +63,7 @@ def get_db_connection():
         return None
 
 def add_toxicity_point(peer_id, user_id):
-    """Гарантированное добавление +1 балла и получение актуального счета"""
+    """Гарантированное добавление +1 балла и получение точного счета"""
     print(f"🔄 [БД] Обновляем балл: peer_id={peer_id}, user_id={user_id}")
     conn = get_db_connection()
     if not conn:
@@ -72,7 +72,7 @@ def add_toxicity_point(peer_id, user_id):
     
     try:
         with conn.cursor() as cur:
-            # 1. Вставляем новую запись или прибавляем +1
+            # 1. Записываем или увеличиваем счет
             cur.execute("""
                 INSERT INTO toxicity_stats (peer_id, user_id, score)
                 VALUES (%s, %s, 1)
@@ -81,7 +81,7 @@ def add_toxicity_point(peer_id, user_id):
             """, (peer_id, user_id))
             conn.commit()
 
-            # 2. Явно читаем итоговое значение
+            # 2. Получаем актуальный счет из базы
             cur.execute("""
                 SELECT score FROM toxicity_stats
                 WHERE peer_id = %s AND user_id = %s;
@@ -90,7 +90,7 @@ def add_toxicity_point(peer_id, user_id):
             
             if row:
                 current_score = row[0]
-                print(f"✅ [БД] Зафиксировано! Текущий счет пользователя {user_id}: {current_score}")
+                print(f"✅ [БД] Успех! Актуальный счет пользователя {user_id}: {current_score}")
                 return current_score
             return 0
     except Exception as e:
@@ -101,7 +101,7 @@ def add_toxicity_point(peer_id, user_id):
         conn.close()
 
 def get_top_users(peer_id):
-    """Получение Топ-10 пользователей беседы"""
+    """Получение Топ-10 токсиков беседы"""
     print(f"🔄 [БД] Запрос ТОПа для peer_id={peer_id}...")
     conn = get_db_connection()
     if not conn:
@@ -115,7 +115,7 @@ def get_top_users(peer_id):
                 LIMIT 10;
             """, (peer_id,))
             rows = cur.fetchall()
-            print(f"✅ [БД] Найдено строк в ТОПе: {len(rows)}")
+            print(f"✅ [БД] Записей в ТОПе: {len(rows)}")
             return rows
     except Exception as e:
         print(f"❌ [БД] Ошибка при получении ТОПа: {e}")
@@ -131,9 +131,9 @@ def send_message(peer_id, text):
                 'message': text,
                 'random_id': 0
             })
-            print(f"✉️ [ВК] Сообщение успешно отправлено в peer_id={peer_id}")
+            print(f"✉️ [ВК] Сообщение отправлено в peer_id={peer_id}")
         except Exception as e:
-            print(f"❌ [ВК] Ошибка отправки сообщения через VK API: {e}")
+            print(f"❌ [ВК] Ошибка VK API: {e}")
 
 def get_user_name(user_id):
     if user_id in user_names_cache:
@@ -149,14 +149,13 @@ def get_user_name(user_id):
                     user_names_cache[user_id] = full_name
                     return full_name
         except Exception as e:
-            print(f"⚠️ [ВК] Не удалось получить имя пользователя {user_id}: {e}")
+            print(f"⚠️ [ВК] Ошибка получения имени: {e}")
     return "Участник"
 
 def analyze_and_generate_response(text):
     clean_key = AI_API_KEY.strip() if AI_API_KEY else ""
-    
     if not clean_key:
-        print("⚠️ [ИИ] Ключ AI_API_KEY не задан, срабатывает резервный ответ")
+        print("⚠️ [ИИ] Ключ AI_API_KEY не задан, сработает автоматический комментарий")
         return True, "участников чата", random.choice(FALLBACK_COMMENTS)
 
     system_instruction = (
@@ -204,11 +203,11 @@ def analyze_and_generate_response(text):
             print(f"⚠️ [ИИ] Ошибка модели {model_name}: {e}")
             continue
 
-    print("⚠️ [ИИ] Модели затаймаутили, засчитываем ТОКСИК по ключевому слову")
+    print("⚠️ [ИИ] Таймаут от ИИ, зафиксирован ТОКСИК по совпадению слов")
     return True, "участников чата", random.choice(FALLBACK_COMMENTS)
 
 def process_message_async(text, peer_id, from_id):
-    # Команда рейтинга
+    # Команда получения рейтинга
     if '!топ' in text.lower() or '!рейтинг' in text.lower():
         announce_text = "🎁 Кто первый наберет 100 баллов токсичности, того ждет признание от Хамульки и секретный приз!\n\n"
         top_users = get_top_users(peer_id)
@@ -222,9 +221,9 @@ def process_message_async(text, peer_id, from_id):
             send_message(peer_id, top_text)
         return
 
-    # Проверка на ключевые слова
+    # Проверка ключевых слов
     if NAMES_PATTERN.search(text) or BAD_WORDS_PATTERN.search(text):
-        print(f"🔍 [Анализ] Найдено совпадение по ключевым словам в тексте: '{text}'")
+        print(f"🔍 [Анализ] Найдено совпадение по триггерам: '{text}'")
         is_toxic, target_name, ai_comment = analyze_and_generate_response(text)
         
         if is_toxic:
