@@ -4,19 +4,30 @@ import json
 import random
 import requests
 import threading
+import time
 import traceback
 import psycopg2
 from flask import Flask, request
 import vk_api
 
 from phrases import NAMES_PATTERN
+from toxic_words import check_toxicity
 
 app = Flask(__name__)
 
 # --- 1. ПЕРЕМЕННЫЕ ОКРУЖЕНИЯ ---
 VK_TOKEN = os.environ.get('VK_TOKEN', '')
 CONFIRMATION_CODE = os.environ.get('CONFIRMATION_CODE', '')
-AI_API_KEY = os.environ.get('AI_API_KEY', '')
+AI_API_KEY = os.environ.get('AI_API_KEY', '')          # Groq (запасная модель)
+GEMINI_API_KEY = os.environ.get('GEMINI_API_KEY', '')  # Google Gemini (основная модель)
+GEMINI_MODELS = ['gemini-3.5-flash-lite', 'gemini-3.1-flash-lite', 'gemini-3.8-flash']
+VK_API_VERSION = '5.199'
+
+# Награды
+TOP1_AWARD = 'top1_medal'      # медаль хамства лидеру топа (вручается один раз на беседу)
+LEGEND_AWARD = 'legend_500'    # секретный приз за 500 баллов
+LEGEND_SCORE = 500
+ASSETS = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'assets')
 DATABASE_URL = os.environ.get('DATABASE_URL', '')
 
 AI_MODELS = [
@@ -36,16 +47,6 @@ FALLBACK_COMMENTS = [
     "👀 Внимание! Замечен несанкционированный наезд.",
     "📉 Градус дружелюбия стремительно упал!"
 ]
-
-BAD_WORDS = [
-    r'хам', r'нахал', r'нагл', r'дерз', r'выпендр', r'понт',
-    r'дур', r'туп', r'идиот', r'клоун', r'твар', r'гнид', r'урод', r'мраз',
-    r'придур', r'кончен', r'чушпан', r'бес', r'сволоч', r'шлюх', r'бред',
-    r'ахрин', r'охрин', r'афиг', r'офиг', r'ахуе', r'охуе',
-    r'заткн', r'завал', r'закрой', r'пошел', r'пошла', r'соси', r'отвал',
-    r'свал', r'исчез', r'съеб', r'оффн', r'пизд'
-]
-BAD_WORDS_PATTERN = re.compile(r'|'.join(BAD_WORDS), re.IGNORECASE)
 
 vk = vk_api.VkApi(token=VK_TOKEN) if VK_TOKEN else None
 processed_msg_ids = set()
@@ -93,8 +94,16 @@ def init_db_structure():
                     PRIMARY KEY (peer_id, user_id)
                 );
             """)
+            cur.execute("""
+                CREATE TABLE IF NOT EXISTS toxicity_awards (
+                    peer_id BIGINT NOT NULL,
+                    award TEXT NOT NULL,
+                    user_id BIGINT NOT NULL,
+                    PRIMARY KEY (peer_id, award)
+                );
+            """)
             conn.commit()
-            print("✅ [БД-ИНИЦИАЛИЗА] Таблица toxicity_stats успешно проверена/создана с PRIMARY KEY(peer_id, user_id).")
+            print("✅ [БД-ИНИЦИАЛИЗА] Таблицы toxicity_stats и toxicity_awards проверены/созданы.")
     except Exception as e:
         print(f"❌ [БД-ИНИЦИАЛИЗА] Ошибка проверки структуры таблицы: {e}")
         traceback.print_exc()
@@ -186,142 +195,339 @@ def get_top_users(peer_id):
         conn.close()
 
 
+def get_awards(peer_id):
+    """{award: user_id} для беседы."""
+    conn = get_db_connection()
+    if not conn:
+        return {}
+    try:
+        with conn.cursor() as cur:
+            cur.execute("SELECT award, user_id FROM toxicity_awards WHERE peer_id = %s;", (peer_id,))
+            return {a: u for a, u in cur.fetchall()}
+    except Exception as e:
+        print(f"❌ [БД НАГРАДЫ]: {e}")
+        return {}
+    finally:
+        conn.close()
+
+def claim_award(peer_id, award, user_id):
+    """Записывает награду. True, если записали сейчас (раньше ее в этой беседе не было)."""
+    conn = get_db_connection()
+    if not conn:
+        return False
+    try:
+        with conn.cursor() as cur:
+            cur.execute("""
+                INSERT INTO toxicity_awards (peer_id, award, user_id) VALUES (%s, %s, %s)
+                ON CONFLICT (peer_id, award) DO NOTHING;
+            """, (peer_id, award, user_id))
+            conn.commit()
+            return cur.rowcount == 1
+    except Exception as e:
+        print(f"❌ [БД НАГРАДЫ]: {e}")
+        conn.rollback()
+        return False
+    finally:
+        conn.close()
+
+def get_all_peers():
+    conn = get_db_connection()
+    if not conn:
+        return []
+    try:
+        with conn.cursor() as cur:
+            cur.execute("SELECT DISTINCT peer_id FROM toxicity_stats;")
+            return [r[0] for r in cur.fetchall()]
+    except Exception as e:
+        print(f"❌ [БД]: {e}")
+        return []
+    finally:
+        conn.close()
+
+
 # --- 3. ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ (VK И ИИ) ---
 
-def send_message(peer_id, text):
+def send_message(peer_id, text, attachment=None):
     if vk:
         try:
-            vk.method('messages.send', {
+            params = {
                 'peer_id': peer_id,
                 'message': text,
-                'random_id': 0
-            })
+                'random_id': random.randint(1, 2**31 - 1)
+            }
+            if attachment:
+                params['attachment'] = attachment
+            vk.method('messages.send', params)
             print(f"✉️ [ВК] Сообщение успешно отправлено в peer_id={peer_id}")
         except Exception as e:
             print(f"❌ [ВК] Ошибка отправки VK API: {e}")
 
+screen_names_cache = {}
+
 def get_user_name(user_id):
+    """Имя человека (Имя Фамилия) или название сообщества, если это бот."""
     if user_id in user_names_cache:
         return user_names_cache[user_id]
+    name = None
     if vk:
         try:
-            res = vk.method('users.get', {'user_ids': user_id})
-            if res and len(res) > 0:
-                first_name = res[0].get('first_name', '')
-                last_name = res[0].get('last_name', '')
-                full_name = f"{first_name} {last_name}".strip()
-                if full_name:
-                    user_names_cache[user_id] = full_name
-                    return full_name
+            if user_id < 0:
+                res = vk.method('groups.getById', {'group_ids': -user_id})
+                groups = res.get('groups', []) if isinstance(res, dict) else res
+                if groups:
+                    name = groups[0].get('name')
+            else:
+                res = vk.method('users.get', {'user_ids': user_id, 'fields': 'screen_name'})
+                if res:
+                    name = f"{res[0].get('first_name', '')} {res[0].get('last_name', '')}".strip()
+                    screen_names_cache[user_id] = res[0].get('screen_name') or f"id{user_id}"
         except Exception as e:
-            print(f"⚠️ [ВК] Ошибка получения имени: {e}")
-    return "Участник"
+            print(f"⚠️ [ВК] Ошибка получения имени {user_id}: {e}")
+    name = name or ("Бот" if user_id < 0 else "Участник")
+    user_names_cache[user_id] = name
+    return name
 
-def analyze_and_generate_response(text):
+def mention(user_id, text=None):
+    """Синяя ссылка на человека. У ботов ссылки не работают, поэтому просто имя."""
+    text = text or get_user_name(user_id)
+    if user_id < 0:
+        return text
+    return f"[id{user_id}|{text}]"
+
+def at_mention(user_id):
+    """Отметка через @ник, чтобы человек увидел уведомление. У ботов просто название."""
+    if user_id < 0:
+        return get_user_name(user_id)
+    get_user_name(user_id)
+    return f"[id{user_id}|@{screen_names_cache.get(user_id, f'id{user_id}')}]"
+
+def upload_photo(peer_id, path):
+    """Загружает картинку для отправки в беседу. Возвращает строку attachment или None."""
+    if not vk or not os.path.exists(path):
+        return None
+    try:
+        server = vk.method('photos.getMessagesUploadServer', {'peer_id': peer_id})
+        with open(path, 'rb') as f:
+            up = requests.post(server['upload_url'], files={'photo': f}, timeout=60).json()
+        saved = vk.method('photos.saveMessagesPhoto', {'photo': up['photo'], 'server': up['server'], 'hash': up['hash']})[0]
+        return f"photo{saved['owner_id']}_{saved['id']}"
+    except Exception as e:
+        print(f"⚠️ [ВК] Не удалось загрузить картинку {path}: {e}")
+        return None
+
+SYSTEM_INSTRUCTION = (
+    "Ты — Хамулька, дерзкая девчонка-гопница из дворового чата аватарии. "
+    "Ты следишь за наездами в беседе: мат, обзывательства, грубые подколы, посылания.\n"
+    "Дружеские шутки без грубости, приветствия, спокойные споры и просто упоминание имени — это НЕ наезд.\n\n"
+    "Если это наезд, ответь строго в формате:\n"
+    "ТОКСИК | [имя того, на кого наехали, или 'участников чата'] | [твой короткий дерзкий смешной комментарий]\n"
+    "Комментарий: одна-две фразы, каждый раз по-новому, с юмором, по-дворовому, без мата, "
+    "можно сленг и эмодзи в начале. Не повторяй шаблоны вроде 'фиксирую наезд'.\n"
+    "Если это не наезд, ответь одним словом: НЕ_ТОКСИК"
+)
+
+def parse_ai(full_content):
+    full_content = re.sub(r'<think>.*?</think>', '', full_content or '', flags=re.DOTALL).strip()
+    if not full_content:
+        return None
+    if "НЕ_ТОКСИК" in full_content or "НЕ ТОКСИК" in full_content:
+        return False, "участников чата", ""
+    parts = [p.strip() for p in full_content.split("|")]
+    if len(parts) >= 3 and parts[2]:
+        return True, parts[1] or "участников чата", parts[2]
+    if len(parts) == 2 and parts[1]:
+        return True, "участников чата", parts[1]
+    return None
+
+def ask_gemini(text):
+    for model_name in GEMINI_MODELS:
+        try:
+            print(f"🤖 [GEMINI] Запрос к модели {model_name}...")
+            r = requests.post(
+                f"https://generativelanguage.googleapis.com/v1beta/models/{model_name}:generateContent",
+                headers={"x-goog-api-key": GEMINI_API_KEY},
+                json={
+                    "systemInstruction": {"parts": [{"text": SYSTEM_INSTRUCTION}]},
+                    "contents": [{"role": "user", "parts": [{"text": f"Фраза из чата: '{text}'"}]}],
+                    "generationConfig": {"temperature": 0.9, "maxOutputTokens": 1024},
+                },
+                timeout=25,
+            )
+            data = r.json()
+            if r.status_code != 200:
+                print(f"⚠️ [GEMINI] {model_name}: HTTP {r.status_code}: {data.get('error', {}).get('message')}")
+                continue
+            parts = (data.get("candidates") or [{}])[0].get("content", {}).get("parts", [])
+            content = "".join(p.get("text", "") for p in parts if not p.get("thought"))
+            print(f"🤖 [GEMINI Ответ ({model_name})]: {content}")
+            parsed = parse_ai(content)
+            if parsed:
+                return parsed
+        except Exception as e:
+            print(f"⚠️ [GEMINI] Ошибка {model_name}: {e}")
+    return None
+
+def ask_groq(text):
     clean_key = AI_API_KEY.strip() if AI_API_KEY else ""
     if not clean_key:
-        print("⚠️ [ИИ] Ключ AI_API_KEY не задан в Render, работаем в режиме фолбэка.")
-        return True, "участников чата", random.choice(FALLBACK_COMMENTS)
-
-    system_instruction = (
-        "Ты — Хамулька, дерзкая девчонка-гопница из дворового чата. "
-        "Твоя задача — строго фиксировать ЛЮБЫЕ наезды, мат, обозвания и подколы.\n"
-        "Слова типа 'дура', 'тупой', 'клоун', 'хам', 'гнида' — это 100% ТОКСИК!\n\n"
-        "ОТВЕЧАЙ СТРОГО В ФОРМАТЕ:\n"
-        "ТОКСИК | [Имя кого задели или 'участников чата'] | [Короткий дерзкий ответ от Хамульки]\n\n"
-        "Если фраза абсолютно добрая ('привет', 'спасибо'), отвечай: НЕ_ТОКСИК"
-    )
-
-    user_prompt = f"Проанализируй фразу из чата: '{text}'"
+        return None
     headers = {"Authorization": f"Bearer {clean_key}", "Content-Type": "application/json"}
-
     for model_name in AI_MODELS:
         payload = {
             "model": model_name,
             "messages": [
-                {"role": "system", "content": system_instruction},
-                {"role": "user", "content": user_prompt}
+                {"role": "system", "content": SYSTEM_INSTRUCTION},
+                {"role": "user", "content": f"Фраза из чата: '{text}'"}
             ],
-            "temperature": 0.5
+            "temperature": 0.8,
+            "max_tokens": 1024,
         }
+        if model_name.startswith("openai/gpt-oss"):
+            payload["reasoning_effort"] = "low"
         try:
-            print(f"🤖 [ИИ] Запрос к модели {model_name}...")
-            response = requests.post(AI_URL, json=payload, headers=headers, timeout=6)
+            print(f"🤖 [GROQ] Запрос к модели {model_name}...")
+            response = requests.post(AI_URL, json=payload, headers=headers, timeout=25)
             if response.status_code == 200:
-                result = response.json()
-                if 'choices' in result and len(result['choices']) > 0:
-                    full_content = result['choices'][0]['message']['content'].strip()
-                    full_content = re.sub(r'<think>.*?</think>', '', full_content, flags=re.DOTALL).strip()
-                    
-                    print(f"🤖 [ИИ Ответ ({model_name})]: {full_content}")
-
-                    if "НЕ_ТОКСИК" in full_content or "НЕ ТОКСИК" in full_content:
-                        return False, "участников чата", ""
-                    
-                    parts = full_content.split("|")
-                    if len(parts) >= 3:
-                        return True, parts[1].strip(), parts[2].strip()
-                    elif len(parts) == 2:
-                        return True, "участников чата", parts[1].strip()
-                    else:
-                        return True, "участников чата", random.choice(FALLBACK_COMMENTS)
+                content = response.json()['choices'][0]['message']['content']
+                print(f"🤖 [GROQ Ответ ({model_name})]: {content}")
+                parsed = parse_ai(content)
+                if parsed:
+                    return parsed
             else:
-                print(f"⚠️ [ИИ] Модель {model_name} вернула HTTP status {response.status_code}: {response.text}")
+                print(f"⚠️ [GROQ] {model_name}: HTTP {response.status_code}")
         except Exception as e:
-            print(f"⚠️ [ИИ] Ошибка обращения к модели {model_name}: {e}")
-            continue
+            print(f"⚠️ [GROQ] Ошибка {model_name}: {e}")
+    return None
 
-    print("⚠️ [ИИ] Все модели ИИ не ответили, переходим на фолбэк-комментарий")
-    return True, "участников чата", random.choice(FALLBACK_COMMENTS)
-
+def analyze_and_generate_response(text):
+    """(токсик?, на кого, комментарий). Сначала Gemini, потом Groq, потом заготовки."""
+    result = (ask_gemini(text) if GEMINI_API_KEY else None) or ask_groq(text)
+    if result:
+        return result
+    print("⚠️ [ИИ] Нейросети не ответили, переходим на заготовку")
+    return None
 
 # --- 4. ОБРАБОТКА СООБЩЕНИЙ ---
 
+TOP_ANNOUNCE = ("🎁 Кто первым в беседе наберет 500 баллов токсичности, того ждет СЕКРЕТНЫЙ приз от Хамульки, "
+                "еще грандиознее медали хамства!\n\n")
+
+def format_top(peer_id, top_users):
+    awards = get_awards(peer_id)
+    medal_holder = awards.get(TOP1_AWARD)
+    legend_holder = awards.get(LEGEND_AWARD)
+    announce = TOP_ANNOUNCE if not legend_holder else "💎 Легенда хамства в этой беседе уже есть, но топ живет дальше: кто сместит лидера?\n\n"
+    text = announce + "🏆 ТОП самых острых на язык в беседе:\n\n"
+    for i, (u_id, count) in enumerate(top_users, 1):
+        badges = ("💎 " if u_id == legend_holder else "") + ("👑 " if u_id == medal_holder else "")
+        text += f"{i}. {badges}{mention(u_id)} — {count} замеченных наездов\n"
+    if medal_holder:
+        text += "\n👑 — обладатель медали хамства"
+    if legend_holder:
+        text += "\n💎 — легенда хамства"
+    return text
+
+def award_top1(peer_id):
+    """Вручает медаль хамства лидеру топа беседы (один раз на беседу)."""
+    top = get_top_users(peer_id)
+    if not top:
+        return
+    leader, score = top[0]
+    if not claim_award(peer_id, TOP1_AWARD, leader):
+        return
+    print(f"🏅 [НАГРАДА] Медаль хамства в беседе {peer_id}: {leader} ({score} баллов)")
+    photo = upload_photo(peer_id, os.path.join(ASSETS, "medal_top1.png"))
+    send_message(peer_id,
+        f"🏅 ВНИМАНИЕ, БЕСЕДА! Хамулька вручает МЕДАЛЬ ХАМСТВА!\n\n"
+        f"{at_mention(leader)}, это тебе! {score} замеченных наездов, первое место в топе, "
+        f"ни у кого язык не острее. Носи с гордостью 🌶️\n\n"
+        f"👑 Встречайте обладателя медали хамства! Теперь в топе рядом с этим именем сияет корона.\n\n"
+        f"🎁 А дальше гонка за СЕКРЕТНЫМ призом: кто первым наберет {LEGEND_SCORE} баллов, "
+        f"получит награду еще грандиознее. Пишите !топ, чтобы следить за гонкой.",
+        attachment=photo)
+
+def check_legend(peer_id, user_id, score):
+    """Секретный приз первому, кто наберет 500 баллов в беседе."""
+    if score < LEGEND_SCORE or not claim_award(peer_id, LEGEND_AWARD, user_id):
+        return
+    print(f"💎 [НАГРАДА] Легенда хамства в беседе {peer_id}: {user_id} ({score})")
+    photo = upload_photo(peer_id, os.path.join(ASSETS, "legend_500.png"))
+    send_message(peer_id,
+        f"💎💎💎 СЕКРЕТНЫЙ ПРИЗ РАСКРЫТ! 💎💎💎\n\n"
+        f"{at_mention(user_id)} первым в беседе набрал(а) {score} баллов и становится ЛЕГЕНДОЙ ХАМСТВА!\n\n"
+        f"👑 Отныне в топе рядом с именем сияет 💎, и это навсегда.\n"
+        f"🌶️ Хамулька снимает кепку и официально признает: острее языка в этом дворе нет.",
+        attachment=photo)
+
+_own_group_id = {"id": None}
+
+def own_group_id():
+    """id сообщества самой Хамульки, чтобы не считать ее собственные сообщения."""
+    if _own_group_id["id"] is None and vk:
+        try:
+            res = vk.method('groups.getById', {})
+            groups = res.get('groups', []) if isinstance(res, dict) else res
+            _own_group_id["id"] = groups[0]['id'] if groups else 0
+        except Exception as e:
+            print(f"⚠️ [ВК] Не удалось узнать свой id: {e}")
+            _own_group_id["id"] = 0
+    return _own_group_id["id"]
+
 def process_message_async(text, peer_id, from_id):
     print(f"\n📩 [НОВОЕ СООБЩЕНИЕ] peer_id={peer_id}, from_id={from_id}, текст: '{text}'")
+    if from_id < 0 and -from_id == own_group_id():
+        return
 
     # Команда ТОПа / рейтинга
     if '!топ' in text.lower() or '!рейтинг' in text.lower():
-        announce_text = "🎁 Кто первый наберет 100 баллов токсичности, того ждет признание от Хамульки и секретный приз!\n\n"
         top_users = get_top_users(peer_id)
         if not top_users:
-            send_message(peer_id, announce_text + "📊 Пока никто не токсичил в беседе!")
+            send_message(peer_id, TOP_ANNOUNCE + "📊 Пока никто не токсичил в беседе!")
         else:
-            top_text = announce_text + "🏆 ТОП самых острых на язык в беседе:\n\n"
-            for i, (u_id, count) in enumerate(top_users, 1):
-                user_name = get_user_name(u_id)
-                top_text += f"{i}. [id{u_id}|{user_name}] — {count} замеченных наездов\n"
-            send_message(peer_id, top_text)
+            send_message(peer_id, format_top(peer_id, top_users))
         return
 
-    # Проверка ключевых слов и матов
     has_name = bool(NAMES_PATTERN.search(text))
-    has_bad_word = bool(BAD_WORDS_PATTERN.search(text))
+    level = check_toxicity(text)
+    if not has_name and not level:
+        return
+    print(f"🔍 [Анализ] имя={has_name}, грубость={level or 'нет'}")
 
-    if has_name or has_bad_word:
-        print(f"🔍 [Анализ] Найдено совпадение (имя={has_name}, плохие слова={has_bad_word})")
-        
-        is_toxic, target_name, ai_comment = analyze_and_generate_response(text)
-        
-        # Если есть явный мат/оскорбление — считаем токсиком гарантированно
-        if has_bad_word:
-            print("🔥 [Анализ] Обнаружено явное оскорбление! Принудительно устанавливаем is_toxic = True")
-            is_toxic = True
-            if not ai_comment:
-                ai_comment = random.choice(FALLBACK_COMMENTS)
+    result = analyze_and_generate_response(text)
+    if result:
+        is_toxic, target_name, ai_comment = result
+    else:
+        is_toxic, target_name, ai_comment = (level == "strong"), "участников чата", random.choice(FALLBACK_COMMENTS)
 
-        print(f"📊 [Итог анализа] is_toxic={is_toxic}, target_name='{target_name}'")
+    # мат и явные оскорбления засчитываются всегда, даже если нейросеть решила иначе
+    if level == "strong" and not is_toxic:
+        print("🔥 [Анализ] Явная грубость: засчитываем, хотя нейросеть сказала 'не токсик'")
+        is_toxic = True
+        ai_comment = ai_comment or random.choice(FALLBACK_COMMENTS)
 
-        if is_toxic:
-            user_count = add_toxicity_point(peer_id, from_id)
-            user_name = get_user_name(from_id)
-            
-            reply = (
-                f"{ai_comment}\n\n"
-                f"🛡️ Фиксация: [id{from_id}|{user_name}], зафиксирован наезд на {target_name}!\n"
-                f"📈 Ваша статистика в банке токсичности: {user_count}"
-            )
-            send_message(peer_id, reply)
+    print(f"📊 [Итог анализа] is_toxic={is_toxic}, target_name='{target_name}'")
+    if not is_toxic:
+        return
+
+    user_count = add_toxicity_point(peer_id, from_id)
+    reply = (
+        f"{ai_comment}\n\n"
+        f"🛡️ Фиксация: {mention(from_id)}, зафиксирован наезд на {target_name}!\n"
+        f"📈 Ваша статистика в банке токсичности: {user_count}"
+    )
+    send_message(peer_id, reply)
+    check_legend(peer_id, from_id, user_count)
+
+
+def award_current_leaders():
+    time.sleep(15)
+    for pid in get_all_peers():
+        try:
+            award_top1(pid)
+        except Exception as e:
+            print(f"❌ [НАГРАДА] Ошибка вручения в {pid}: {e}")
+
+threading.Thread(target=award_current_leaders, daemon=True).start()
 
 
 # --- 5. FLASK СЕРВЕР И WEBHOOK ---
@@ -345,12 +551,12 @@ def bot():
         obj = data.get('object', {})
         message = obj.get('message', obj)
         
-        msg_id = message.get('id') or message.get('conversation_message_id')
+        msg_id = (message.get('peer_id'), message.get('conversation_message_id'), message.get('id'))
         text = message.get('text', '')
         peer_id = message.get('peer_id')
         from_id = message.get('from_id')
         
-        if msg_id:
+        if msg_id[1] or msg_id[2]:
             if msg_id in processed_msg_ids:
                 return 'ok'
             processed_msg_ids.add(msg_id)
