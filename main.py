@@ -15,6 +15,11 @@ from toxic_words import check_toxicity
 
 app = Flask(__name__)
 
+# чтобы логи сразу появлялись в Render
+import sys
+sys.stdout.reconfigure(line_buffering=True)
+sys.stderr.reconfigure(line_buffering=True)
+
 # --- 1. ПЕРЕМЕННЫЕ ОКРУЖЕНИЯ ---
 VK_TOKEN = os.environ.get('VK_TOKEN', '')
 CONFIRMATION_CODE = os.environ.get('CONFIRMATION_CODE', '')
