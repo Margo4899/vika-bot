@@ -313,7 +313,14 @@ def upload_photo(peer_id, path):
     try:
         server = vk.method('photos.getMessagesUploadServer', {'peer_id': peer_id})
         with open(path, 'rb') as f:
-            up = requests.post(server['upload_url'], files={'photo': f}, timeout=60).json()
+            data = f.read()
+        resp = requests.post(server['upload_url'],
+                             files={'photo': (os.path.basename(path), data, 'image/png')}, timeout=60)
+        print(f"🖼 [ВК] Ответ загрузки картинки: HTTP {resp.status_code}: {resp.text[:200]}")
+        up = resp.json()
+        if not up.get('photo') or up.get('photo') == '[]':
+            print("⚠️ [ВК] Сервер ВК не принял картинку")
+            return None
         saved = vk.method('photos.saveMessagesPhoto', {'photo': up['photo'], 'server': up['server'], 'hash': up['hash']})[0]
         return f"photo{saved['owner_id']}_{saved['id']}"
     except Exception as e:
@@ -442,6 +449,8 @@ def award_top1(peer_id):
         return
     print(f"🏅 [НАГРАДА] Медаль хамства в беседе {peer_id}: {leader} ({score} баллов)")
     photo = upload_photo(peer_id, os.path.join(ASSETS, "medal_top1.png"))
+    if photo:
+        claim_award(peer_id, "top1_photo", leader)
     send_message(peer_id,
         f"🏅 ВНИМАНИЕ, БЕСЕДА! Хамулька вручает МЕДАЛЬ ХАМСТВА!\n\n"
         f"{at_mention(leader)}, это тебе! {score} замеченных наездов, первое место в топе, "
@@ -524,11 +533,23 @@ def process_message_async(text, peer_id, from_id):
     check_legend(peer_id, from_id, user_count)
 
 
+def resend_medal_photo(peer_id):
+    """Если медаль вручили, а картинка тогда не загрузилась, досылаем ее один раз."""
+    awards = get_awards(peer_id)
+    holder = awards.get(TOP1_AWARD)
+    if not holder or "top1_photo" in awards or holder < 0:
+        return
+    photo = upload_photo(peer_id, os.path.join(ASSETS, "medal_top1.png"))
+    if photo and claim_award(peer_id, "top1_photo", holder):
+        send_message(peer_id, f"🏅 А вот и сама медаль хамства для {at_mention(holder)}! Повесь на видное место 🌶️",
+                     attachment=photo)
+
 def award_current_leaders():
     time.sleep(15)
     for pid in get_all_peers():
         try:
             award_top1(pid)
+            resend_medal_photo(pid)
         except Exception as e:
             print(f"❌ [НАГРАДА] Ошибка вручения в {pid}: {e}")
 
