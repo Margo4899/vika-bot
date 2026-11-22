@@ -774,16 +774,21 @@ def catch_up():
     me = own_group_id()
     for pid in get_all_peers():
         base = BASELINE_SEEN.get(pid)
+        if base is None:
+            base = 0  # еще не знаем, где остановились: проверим только доступ, отвечать не будем
+            probe = True
+        else:
+            probe = False
         try:
-            res = vk.method('messages.getHistory', {'peer_id': pid, 'count': 40})
+            ids = ",".join(str(c) for c in range(base + 1, base + 101))
+            res = vk.method('messages.getByConversationMessageId',
+                            {'peer_id': pid, 'conversation_message_ids': ids})
         except Exception as e:
             print(f"⚠️ [ДОГОНЯЕМ] Не удалось прочитать беседу {pid}: {e}")
             continue
         items = sorted(res.get('items', []), key=lambda m: m.get('conversation_message_id', 0))
-        if base is None:
-            # первый запуск с этой функцией: просто запоминаем, где мы, без старых сообщений
-            if items:
-                mark_seen(pid, items[-1].get('conversation_message_id'))
+        print(f"🔁 [ДОГОНЯЕМ] Беседа {pid}: доступ к сообщениям есть, найдено {len(items)}")
+        if probe:
             continue
         missed = [m for m in items
                   if m.get('conversation_message_id', 0) > base
