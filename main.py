@@ -252,7 +252,16 @@ def get_all_peers():
 
 # --- 3. ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ (VK И ИИ) ---
 
+# Слова, на которые откликаются другие боты (ГигаЧат и т.п.). В наших сообщениях
+# между буквами ставим невидимый символ: на экране выглядит так же, а бот его не узнает.
+TRIGGER_WORDS = re.compile(r"гига|giga|гигач|gigach|сбер|sber", re.IGNORECASE)
+INVISIBLE = "\u2060"
+
+def hide_triggers(text):
+    return TRIGGER_WORDS.sub(lambda m: INVISIBLE.join(m.group(0)), text or "")
+
 def send_message(peer_id, text, attachment=None):
+    text = hide_triggers(text)
     if vk:
         try:
             params = {
