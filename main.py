@@ -24,7 +24,7 @@ sys.stderr.reconfigure(line_buffering=True)
 VK_TOKEN = os.environ.get('VK_TOKEN', '')
 CONFIRMATION_CODE = os.environ.get('CONFIRMATION_CODE', '')
 AI_API_KEY = os.environ.get('AI_API_KEY', '')          # Groq (запасная модель)
-GEMINI_API_KEY = os.environ.get('GEMINI_API_KEY', '')  # Google Gemini (основная модель)
+GEMINI_API_KEY = os.environ.get('GEMINI_API_KEY') or os.environ.get('GEMINI_TOKEN', '')  # Google Gemini (основная модель)
 GEMINI_MODELS = ['gemini-3.5-flash-lite', 'gemini-3.1-flash-lite', 'gemini-3.8-flash']
 VK_API_VERSION = '5.199'
 
