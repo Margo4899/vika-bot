@@ -100,6 +100,14 @@ def init_db_structure():
                 );
             """)
             cur.execute("""
+                CREATE TABLE IF NOT EXISTS toxicity_handled (
+                    peer_id BIGINT NOT NULL,
+                    cmid BIGINT NOT NULL,
+                    created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+                    PRIMARY KEY (peer_id, cmid)
+                );
+            """)
+            cur.execute("""
                 CREATE TABLE IF NOT EXISTS toxicity_seen (
                     peer_id BIGINT PRIMARY KEY,
                     last_cmid BIGINT NOT NULL DEFAULT 0
@@ -275,6 +283,28 @@ def mark_seen(peer_id, cmid):
     finally:
         conn.close()
 
+def claim_message(peer_id, cmid):
+    """True, если это сообщение еще никто не обрабатывал. Запоминаем в базе,
+    чтобы поздний повтор от ВК не обработался второй раз даже после перезапуска."""
+    conn = get_db_connection()
+    if not conn:
+        return True
+    try:
+        with conn.cursor() as cur:
+            cur.execute("INSERT INTO toxicity_handled (peer_id, cmid) VALUES (%s, %s) ON CONFLICT DO NOTHING;",
+                        (peer_id, cmid))
+            fresh = cur.rowcount == 1
+            if fresh and random.random() < 0.02:
+                cur.execute("DELETE FROM toxicity_handled WHERE created_at < now() - interval '3 days';")
+            conn.commit()
+            return fresh
+    except Exception as e:
+        print(f"❌ [БД HANDLED]: {e}")
+        conn.rollback()
+        return True
+    finally:
+        conn.close()
+
 def get_all_peers():
     conn = get_db_connection()
     if not conn:
@@ -393,7 +423,7 @@ SYSTEM_INSTRUCTION = (
     "если на всех или непонятно — 'участников чата'.\n"
     "комментарий: одно-два предложения, до 30 слов, сначала 1-2 эмодзи. Отвечай автору наезда так же дерзко "
     "и по-хамски, в тему его сообщения: подхвати его слова и переверни их против него, "
-    "как острая дворовая девчонка, которой палец в рот не клади. Можно назвать автора по имени. "
+    "как острая дворовая девчонка, которой палец в рот не клади. Обращаться можно только к автору ПОСЛЕДНЕГО сообщения (его имя дано), имена из предыдущих сообщений для обращения не используй. "
     "Без мата, без угроз и без оскорблений внешности и семьи. Каждый раз по-новому, никаких 'фиксирую наезд'.\n"
     "Если это не наезд, ответь одним словом: НЕ_ТОКСИК"
 )
@@ -441,7 +471,9 @@ def build_user_prompt(peer_id, from_id, text):
     hist = list(CHAT_HISTORY.get(peer_id, []))[:-1][-4:]
     lines = [f"{get_user_name(u).split()[0]}: {t}" for u, t in hist if t]
     ctx = ("Предыдущие сообщения беседы:\n" + "\n".join(lines) + "\n\n") if lines else ""
-    return f"{ctx}ПОСЛЕДНЕЕ сообщение (его и оцени), автор {get_user_name(from_id).split()[0]}: '{text}'"
+    author = get_user_name(from_id).split()[0]
+    return (f"{ctx}ПОСЛЕДНЕЕ сообщение (его и оцени), автор {author}: '{text}'\n"
+            f"Если отвечаешь, обращайся только к {author}, а не к другим людям из переписки.")
 
 def ask_gemini(text):
     for model_name in GEMINI_MODELS:
@@ -660,6 +692,9 @@ def handle_message(text, peer_id, from_id, cmid=None, date=None, source="ВК"):
             _handled.add((peer_id, cmid))
             if len(_handled) > 5000:
                 _handled.clear()
+        if not claim_message(peer_id, cmid):
+            print(f"🔁 [{source}] Сообщение {cmid} уже обработано раньше, повтор пропускаем")
+            return
     late = int(time.time() - date) if date else 0
     if late > 60:
         print(f"⏰ [{source}] Сообщение опоздало на {late // 60} мин")
