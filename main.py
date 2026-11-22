@@ -340,6 +340,8 @@ SYSTEM_INSTRUCTION = (
     "Ты — Хамулька, дерзкая девчонка-гопница из дворового чата аватарии. Ты ведешь банк хамства: "
     "ловишь наезды в беседе (мат, обзывательства, грубые подколы, посылания, издевки, токсичный сарказм, "
     "унижения, агрессивный крик) и отвечаешь на них.\n"
+    "Хамство, нахальство, наглость, грубость, дерзость, борзота (хам, нахал, нахамил, обнаглел, не борзей, хабалка) — "
+    "тоже наезд, сила 1.\n"
     "НЕ наезд: дружеские шутки без грубости, приветствия, спокойные споры, жалобы на игру, "
     "грубое слово не про человека (\"блин, опять лагает\"), просто упоминание имени.\n"
     "Тебе дают несколько последних сообщений беседы для понимания, кто кому отвечает. "
@@ -460,10 +462,14 @@ def ask_groq(text):
             print(f"⚠️ [GROQ] Ошибка {model_name}: {e}")
     return None
 
-def analyze_and_generate_response(text, peer_id=None, from_id=None):
+def analyze_and_generate_response(text, peer_id=None, from_id=None, level=None):
     """(токсик?, на кого, комментарий, сила). Сначала Gemini, потом Groq, потом заготовки."""
     if peer_id and from_id:
         text = build_user_prompt(peer_id, from_id, text)
+    if level == "mild":
+        text += "\n(тут хамство или нахальство: это наезд, сила 1)"
+    elif level == "strong":
+        text += "\n(тут мат или оскорбление: это наезд)"
     result = (ask_gemini(text) if GEMINI_API_KEY else None) or ask_groq(text)
     if result:
         return result
@@ -628,18 +634,19 @@ def process_message_async(text, peer_id, from_id):
         return
     print(f"🔍 [Анализ] имя={has_name}, грубость={level or 'нет'}")
 
-    result = analyze_and_generate_response(text, peer_id, from_id)
+    result = analyze_and_generate_response(text, peer_id, from_id, level)
     if result:
         is_toxic, target_name, ai_comment, power = result
     else:
-        is_toxic, target_name, ai_comment, power = (level == "strong"), "участников чата", random.choice(FALLBACK_COMMENTS), 2
+        is_toxic, target_name, ai_comment = level in ("strong", "mild"), "участников чата", random.choice(FALLBACK_COMMENTS)
+        power = 2 if level == "strong" else 1
 
-    # мат и явные оскорбления засчитываются всегда, даже если нейросеть решила иначе
-    if level == "strong" and not is_toxic:
+    # мат, оскорбления, хамство и нахальство засчитываются всегда, даже если нейросеть решила иначе
+    if level in ("strong", "mild") and not is_toxic:
         print("🔥 [Анализ] Явная грубость: засчитываем, хотя нейросеть сказала 'не токсик'")
         is_toxic = True
         ai_comment = ai_comment or random.choice(FALLBACK_COMMENTS)
-        power = max(power, 2)
+        power = 2 if level == "strong" else 1
 
     print(f"📊 [Итог анализа] is_toxic={is_toxic}, target_name='{target_name}'")
     if not is_toxic:
