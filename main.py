@@ -328,13 +328,22 @@ def upload_photo(peer_id, path):
         return None
 
 SYSTEM_INSTRUCTION = (
-    "Ты — Хамулька, дерзкая девчонка-гопница из дворового чата аватарии. "
-    "Ты следишь за наездами в беседе: мат, обзывательства, грубые подколы, посылания.\n"
-    "Дружеские шутки без грубости, приветствия, спокойные споры и просто упоминание имени — это НЕ наезд.\n\n"
-    "Если это наезд, ответь строго в формате:\n"
-    "ТОКСИК | [имя того, на кого наехали, или 'участников чата'] | [твой короткий дерзкий смешной комментарий]\n"
-    "Комментарий: одна-две фразы, каждый раз по-новому, с юмором, по-дворовому, без мата, "
-    "можно сленг и эмодзи в начале. Не повторяй шаблоны вроде 'фиксирую наезд'.\n"
+    "Ты — Хамулька, дерзкая девчонка-гопница из дворового чата аватарии. Ты ведешь банк хамства: "
+    "ловишь наезды в беседе (мат, обзывательства, грубые подколы, посылания, издевки, токсичный сарказм, "
+    "унижения, агрессивный крик) и отвечаешь на них.\n"
+    "НЕ наезд: дружеские шутки без грубости, приветствия, спокойные споры, жалобы на игру, "
+    "грубое слово не про человека (\"блин, опять лагает\"), просто упоминание имени.\n"
+    "Тебе дают несколько последних сообщений беседы для понимания, кто кому отвечает. "
+    "Оценивай только ПОСЛЕДНЕЕ сообщение.\n\n"
+    "Если последнее сообщение — наезд, ответь строго одной строкой:\n"
+    "ТОКСИК | сила 1-3 | на кого | комментарий\n"
+    "сила: 1 легкий подкол, 2 грубо, 3 мат или жесткое оскорбление.\n"
+    "на кого: имя того, на кого наехали, в винительном падеже (на Машу, на Олега); "
+    "если на всех или непонятно — 'участников чата'.\n"
+    "комментарий: РОВНО ОДНО предложение, до 18 слов, сначала 1-2 эмодзи. Отвечай автору наезда так же дерзко "
+    "и по-хамски, в тему его сообщения: подхвати его слова и переверни их против него, "
+    "как острая дворовая девчонка, которой палец в рот не клади. Можно назвать автора по имени. "
+    "Без мата, без угроз и без оскорблений внешности и семьи. Каждый раз по-новому, никаких 'фиксирую наезд'.\n"
     "Если это не наезд, ответь одним словом: НЕ_ТОКСИК"
 )
 
@@ -343,13 +352,44 @@ def parse_ai(full_content):
     if not full_content:
         return None
     if "НЕ_ТОКСИК" in full_content or "НЕ ТОКСИК" in full_content:
-        return False, "участников чата", ""
-    parts = [p.strip() for p in full_content.split("|")]
-    if len(parts) >= 3 and parts[2]:
-        return True, parts[1] or "участников чата", parts[2]
-    if len(parts) == 2 and parts[1]:
-        return True, "участников чата", parts[1]
-    return None
+        return False, "участников чата", "", 0
+    line = next((l for l in full_content.splitlines() if "|" in l), full_content)
+    parts = [p.strip() for p in line.split("|")]
+    if parts and "ТОКСИК" in parts[0].upper():
+        parts = parts[1:]
+    power = 1
+    if parts and re.fullmatch(r"(сила\s*)?[123]", parts[0].lower()):
+        power = int(parts[0][-1])
+        parts = parts[1:]
+    if len(parts) >= 2 and parts[-1]:
+        target, comment = parts[0] or "участников чата", parts[-1]
+    elif len(parts) == 1 and parts[0]:
+        target, comment = "участников чата", parts[0]
+    else:
+        return None
+    target = re.sub(r"^на\s+", "", target, flags=re.IGNORECASE).strip(" '\"") or "участников чата"
+    comment = one_sentence(comment)
+    return True, target, comment, power
+
+def one_sentence(text):
+    """Оставляем одно предложение (эмодзи в начале сохраняются)."""
+    text = re.sub(r"\s+", " ", (text or "").strip(" '\""))
+    m = re.match(r"(.+?[.!?…]+)(\s+[^\s].*)?$", text)
+    first = m.group(1) if m else text
+    return first if len(first) >= 12 else text
+
+# Последние сообщения каждой беседы, чтобы нейросеть понимала, кто кому отвечает
+from collections import deque
+CHAT_HISTORY = {}
+
+def remember_chat(peer_id, from_id, text):
+    CHAT_HISTORY.setdefault(peer_id, deque(maxlen=6)).append((from_id, (text or "")[:300]))
+
+def build_user_prompt(peer_id, from_id, text):
+    hist = list(CHAT_HISTORY.get(peer_id, []))[:-1][-4:]
+    lines = [f"{get_user_name(u).split()[0]}: {t}" for u, t in hist if t]
+    ctx = ("Предыдущие сообщения беседы:\n" + "\n".join(lines) + "\n\n") if lines else ""
+    return f"{ctx}ПОСЛЕДНЕЕ сообщение (его и оцени), автор {get_user_name(from_id).split()[0]}: '{text}'"
 
 def ask_gemini(text):
     for model_name in GEMINI_MODELS:
@@ -360,7 +400,7 @@ def ask_gemini(text):
                 headers={"x-goog-api-key": GEMINI_API_KEY},
                 json={
                     "systemInstruction": {"parts": [{"text": SYSTEM_INSTRUCTION}]},
-                    "contents": [{"role": "user", "parts": [{"text": f"Фраза из чата: '{text}'"}]}],
+                    "contents": [{"role": "user", "parts": [{"text": text}]}],
                     "generationConfig": {"temperature": 0.9, "maxOutputTokens": 1024},
                 },
                 timeout=25,
@@ -389,7 +429,7 @@ def ask_groq(text):
             "model": model_name,
             "messages": [
                 {"role": "system", "content": SYSTEM_INSTRUCTION},
-                {"role": "user", "content": f"Фраза из чата: '{text}'"}
+                {"role": "user", "content": text}
             ],
             "temperature": 0.8,
             "max_tokens": 1024,
@@ -411,8 +451,10 @@ def ask_groq(text):
             print(f"⚠️ [GROQ] Ошибка {model_name}: {e}")
     return None
 
-def analyze_and_generate_response(text):
-    """(токсик?, на кого, комментарий). Сначала Gemini, потом Groq, потом заготовки."""
+def analyze_and_generate_response(text, peer_id=None, from_id=None):
+    """(токсик?, на кого, комментарий, сила). Сначала Gemini, потом Groq, потом заготовки."""
+    if peer_id and from_id:
+        text = build_user_prompt(peer_id, from_id, text)
     result = (ask_gemini(text) if GEMINI_API_KEY else None) or ask_groq(text)
     if result:
         return result
@@ -420,6 +462,41 @@ def analyze_and_generate_response(text):
     return None
 
 # --- 4. ОБРАБОТКА СООБЩЕНИЙ ---
+
+# Звания по баллам в банке хамства
+RANKS = [
+    (0,   "🐣", "Хамчик-новичок"),
+    (10,  "😼", "Дерзила"),
+    (30,  "🌶️", "Острый язычок"),
+    (60,  "🔥", "Токсик района"),
+    (100, "⚡", "Гроза беседы"),
+    (200, "☠️", "Ядовитый босс"),
+    (350, "👹", "Монстр хамства"),
+    (500, "💎", "Легенда хамства"),
+]
+
+def rank_for(score):
+    r = RANKS[0]
+    for item in RANKS:
+        if score >= item[0]:
+            r = item
+    return r
+
+def next_rank(score):
+    return next((r for r in RANKS if r[0] > score), None)
+
+POWER_MARKS = {1: "🌶️", 2: "🌶️🌶️", 3: "🌶️🌶️🌶️"}
+
+# Серии наездов: несколько подряд за короткое время
+COMBO_WINDOW = 180  # секунд
+_combo = {}  # (peer, user) -> (сколько подряд, время последнего)
+
+def bump_combo(peer_id, user_id):
+    n, last = _combo.get((peer_id, user_id), (0, 0))
+    now = time.time()
+    n = n + 1 if now - last < COMBO_WINDOW else 1
+    _combo[(peer_id, user_id)] = (n, now)
+    return n
 
 TOP_ANNOUNCE = ("🎁 Кто первым в беседе наберет 500 баллов токсичности, того ждет СЕКРЕТНЫЙ приз от Хамульки, "
                 "еще грандиознее медали хамства!\n\n")
@@ -432,7 +509,8 @@ def format_top(peer_id, top_users):
     text = announce + "🏆 ТОП самых острых на язык в беседе:\n\n"
     for i, (u_id, count) in enumerate(top_users, 1):
         badges = ("💎 " if u_id == legend_holder else "") + ("👑 " if u_id == medal_holder else "")
-        text += f"{i}. {badges}{mention(u_id)} — {count} замеченных наездов\n"
+        emoji, title = rank_for(count)[1:]
+        text += f"{i}. {badges}{mention(u_id)} — {count} {emoji} {title}\n"
     if medal_holder:
         text += "\n👑 — обладатель медали хамства"
     if legend_holder:
@@ -501,35 +579,49 @@ def process_message_async(text, peer_id, from_id):
             send_message(peer_id, format_top(peer_id, top_users))
         return
 
+    remember_chat(peer_id, from_id, text)
     has_name = bool(NAMES_PATTERN.search(text))
     level = check_toxicity(text)
     if not has_name and not level:
         return
     print(f"🔍 [Анализ] имя={has_name}, грубость={level or 'нет'}")
 
-    result = analyze_and_generate_response(text)
+    result = analyze_and_generate_response(text, peer_id, from_id)
     if result:
-        is_toxic, target_name, ai_comment = result
+        is_toxic, target_name, ai_comment, power = result
     else:
-        is_toxic, target_name, ai_comment = (level == "strong"), "участников чата", random.choice(FALLBACK_COMMENTS)
+        is_toxic, target_name, ai_comment, power = (level == "strong"), "участников чата", random.choice(FALLBACK_COMMENTS), 2
 
     # мат и явные оскорбления засчитываются всегда, даже если нейросеть решила иначе
     if level == "strong" and not is_toxic:
         print("🔥 [Анализ] Явная грубость: засчитываем, хотя нейросеть сказала 'не токсик'")
         is_toxic = True
         ai_comment = ai_comment or random.choice(FALLBACK_COMMENTS)
+        power = max(power, 2)
 
     print(f"📊 [Итог анализа] is_toxic={is_toxic}, target_name='{target_name}'")
     if not is_toxic:
         return
 
     user_count = add_toxicity_point(peer_id, from_id)
-    reply = (
-        f"{ai_comment}\n\n"
-        f"🛡️ Фиксация: {mention(from_id)}, зафиксирован наезд на {target_name}!\n"
-        f"📈 Ваша статистика в банке токсичности: {user_count}"
-    )
-    send_message(peer_id, reply)
+    combo = bump_combo(peer_id, from_id)
+    old_rank, new_rank = rank_for(user_count - 1), rank_for(user_count)
+    target_line = "на всю беседу" if target_name == "участников чата" else f"на {target_name}"
+    lines = [
+        ai_comment,
+        "",
+        f"🚨 {mention(from_id)} → наезд {target_line} {POWER_MARKS.get(power, '🌶️')}",
+        f"🏦 Банк хамства: {user_count} · {new_rank[1]} {new_rank[2]}",
+    ]
+    if combo >= 3:
+        lines.append(f"⚡ КОМБО x{combo}! Язык без тормозов")
+    if new_rank != old_rank:
+        lines.append(f"🆙 НОВОЕ ЗВАНИЕ: {new_rank[1]} {new_rank[2]}!")
+    elif user_count < LEGEND_SCORE and not get_awards(peer_id).get(LEGEND_AWARD):
+        nr = next_rank(user_count)
+        if nr and nr[0] - user_count <= 3:
+            lines.append(f"🎯 До звания «{nr[2]}» осталось {nr[0] - user_count}")
+    send_message(peer_id, "\n".join(lines))
     check_legend(peer_id, from_id, user_count)
 
 
