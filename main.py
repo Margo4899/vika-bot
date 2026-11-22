@@ -501,6 +501,33 @@ def bump_combo(peer_id, user_id):
 TOP_ANNOUNCE = ("🎁 Кто первым в беседе наберет 500 баллов токсичности, того ждет СЕКРЕТНЫЙ приз от Хамульки, "
                 "еще грандиознее медали хамства!\n\n")
 
+def rules_text(peer_id):
+    ranks = "\n".join(f"{emoji} {title} — от {score}" for score, emoji, title in RANKS[:-1])
+    legend = get_awards(peer_id).get(LEGEND_AWARD)
+    prize = ("💎 Легенда хамства в этой беседе уже есть. Но корону 👑 лидера можно отобрать в любой момент!"
+             if legend else
+             f"🎁 Кто первым в беседе наберет {LEGEND_SCORE} баллов, получит СЕКРЕТНЫЙ приз, еще грандиознее медали хамства!")
+    return (
+        "📜 ПРАВИЛА БАНКА ХАМСТВА 🌶️\n\n"
+        "Хамулька следит за беседой и записывает каждый наезд в банк хамства.\n\n"
+        "🏦 Баллы\n"
+        "За каждый наезд +1 балл. Шутки по-доброму и обычные споры не считаются.\n\n"
+        "🌶️ Сила наезда\n"
+        "🌶️ легкий подкол\n"
+        "🌶️🌶️ грубо\n"
+        "🌶️🌶️🌶️ жестко\n\n"
+        "🎖 Звания\n"
+        f"{ranks}\n\n"
+        "⚡ Комбо\n"
+        "3 наезда подряд за 3 минуты — КОМБО!\n\n"
+        "👑 Медаль хамства\n"
+        "Лидер топа получает медаль хамства и корону 👑 рядом с именем.\n\n"
+        f"{prize}\n\n"
+        "⌨️ Команды\n"
+        "!топ — топ самых острых на язык\n"
+        "!правила — эти правила"
+    )
+
 def format_top(peer_id, top_users):
     awards = get_awards(peer_id)
     medal_holder = awards.get(TOP1_AWARD)
@@ -570,13 +597,19 @@ def process_message_async(text, peer_id, from_id):
     if from_id < 0 and -from_id == own_group_id():
         return
 
+    # Правила
+    low = text.lower().strip()
+    if low in ("!правила", "!помощь", "!хамулька", "/правила", "правила хамульки", "!rules"):
+        send_message(peer_id, rules_text(peer_id))
+        return
+
     # Команда ТОПа / рейтинга
     if '!топ' in text.lower() or '!рейтинг' in text.lower():
         top_users = get_top_users(peer_id)
         if not top_users:
             send_message(peer_id, TOP_ANNOUNCE + "📊 Пока никто не токсичил в беседе!")
         else:
-            send_message(peer_id, format_top(peer_id, top_users))
+            send_message(peer_id, format_top(peer_id, top_users) + "\n\n📜 Правила: !правила")
         return
 
     remember_chat(peer_id, from_id, text)
