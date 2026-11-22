@@ -100,6 +100,12 @@ def init_db_structure():
                 );
             """)
             cur.execute("""
+                CREATE TABLE IF NOT EXISTS toxicity_seen (
+                    peer_id BIGINT PRIMARY KEY,
+                    last_cmid BIGINT NOT NULL DEFAULT 0
+                );
+            """)
+            cur.execute("""
                 CREATE TABLE IF NOT EXISTS toxicity_awards (
                     peer_id BIGINT NOT NULL,
                     award TEXT NOT NULL,
@@ -232,6 +238,40 @@ def claim_award(peer_id, award, user_id):
         print(f"❌ [БД НАГРАДЫ]: {e}")
         conn.rollback()
         return False
+    finally:
+        conn.close()
+
+def get_last_seen_all():
+    """{peer_id: номер последнего обработанного сообщения}."""
+    conn = get_db_connection()
+    if not conn:
+        return {}
+    try:
+        with conn.cursor() as cur:
+            cur.execute("SELECT peer_id, last_cmid FROM toxicity_seen;")
+            return {p: c for p, c in cur.fetchall()}
+    except Exception as e:
+        print(f"❌ [БД SEEN]: {e}")
+        return {}
+    finally:
+        conn.close()
+
+def mark_seen(peer_id, cmid):
+    if not cmid:
+        return
+    conn = get_db_connection()
+    if not conn:
+        return
+    try:
+        with conn.cursor() as cur:
+            cur.execute("""
+                INSERT INTO toxicity_seen (peer_id, last_cmid) VALUES (%s, %s)
+                ON CONFLICT (peer_id) DO UPDATE SET last_cmid = GREATEST(toxicity_seen.last_cmid, EXCLUDED.last_cmid);
+            """, (peer_id, cmid))
+            conn.commit()
+    except Exception as e:
+        print(f"❌ [БД SEEN]: {e}")
+        conn.rollback()
     finally:
         conn.close()
 
@@ -608,9 +648,34 @@ def own_group_id():
             _own_group_id["id"] = 0
     return _own_group_id["id"]
 
-def process_message_async(text, peer_id, from_id):
+_seen_lock = threading.Lock()
+_handled = set()   # (peer_id, cmid) уже обработанные, чтобы повтор от ВК не считался дважды
+
+def handle_message(text, peer_id, from_id, cmid=None, date=None, source="ВК"):
+    """Общий вход: и для сообщений от ВК, и для догоняющих после сна."""
+    if cmid:
+        with _seen_lock:
+            if (peer_id, cmid) in _handled:
+                return
+            _handled.add((peer_id, cmid))
+            if len(_handled) > 5000:
+                _handled.clear()
+    late = int(time.time() - date) if date else 0
+    if late > 60:
+        print(f"⏰ [{source}] Сообщение опоздало на {late // 60} мин")
+    try:
+        process_message_async(text, peer_id, from_id, late)
+    finally:
+        mark_seen(peer_id, cmid)
+
+STALE_COMMAND_SEC = 300  # !топ и !правила старше 5 минут уже не отвечаем, чтобы не было "топа из ниоткуда"
+
+def process_message_async(text, peer_id, from_id, late=0):
     print(f"\n📩 [НОВОЕ СООБЩЕНИЕ] peer_id={peer_id}, from_id={from_id}, текст: '{text}'")
     if from_id < 0 and -from_id == own_group_id():
+        return
+    if late > STALE_COMMAND_SEC and text.strip().lower().startswith(("!", "/")):
+        print("⏰ Старая команда, пропускаем")
         return
 
     # Правила
@@ -697,6 +762,42 @@ def award_current_leaders():
 
 threading.Thread(target=award_current_leaders, daemon=True).start()
 
+# --- Догоняем сообщения, пока Хамулька спала ---
+# Бесплатный Render засыпает. ВК пытается доставить сообщение, не дожидается пробуждения
+# и откладывает повтор на потом. Поэтому, проснувшись, Хамулька сама забирает из бесед
+# всё, что пропустила, и отвечает сразу, а поздние повторы от ВК потом просто пропускаются.
+CATCHUP_MAX_AGE = 3 * 3600
+BASELINE_SEEN = get_last_seen_all()
+
+def catch_up():
+    time.sleep(2)
+    me = own_group_id()
+    for pid in get_all_peers():
+        base = BASELINE_SEEN.get(pid)
+        try:
+            res = vk.method('messages.getHistory', {'peer_id': pid, 'count': 40})
+        except Exception as e:
+            print(f"⚠️ [ДОГОНЯЕМ] Не удалось прочитать беседу {pid}: {e}")
+            continue
+        items = sorted(res.get('items', []), key=lambda m: m.get('conversation_message_id', 0))
+        if base is None:
+            # первый запуск с этой функцией: просто запоминаем, где мы, без старых сообщений
+            if items:
+                mark_seen(pid, items[-1].get('conversation_message_id'))
+            continue
+        missed = [m for m in items
+                  if m.get('conversation_message_id', 0) > base
+                  and time.time() - m.get('date', 0) < CATCHUP_MAX_AGE
+                  and not (m.get('from_id', 0) < 0 and -m.get('from_id') == me)]
+        if missed:
+            print(f"🔁 [ДОГОНЯЕМ] Беседа {pid}: пропущено сообщений: {len(missed)}")
+        for m in missed:
+            handle_message(m.get('text', ''), pid, m.get('from_id'), m.get('conversation_message_id'),
+                           m.get('date'), source="ДОГОНЯЕМ")
+
+if vk:
+    threading.Thread(target=catch_up, daemon=True).start()
+
 
 # --- 5. FLASK СЕРВЕР И WEBHOOK ---
 
@@ -724,15 +825,10 @@ def bot():
         peer_id = message.get('peer_id')
         from_id = message.get('from_id')
         
-        if msg_id[1] or msg_id[2]:
-            if msg_id in processed_msg_ids:
-                return 'ok'
-            processed_msg_ids.add(msg_id)
-            if len(processed_msg_ids) > 1000:
-                processed_msg_ids.clear()
-
         if peer_id and from_id:
-            threading.Thread(target=process_message_async, args=(text, peer_id, from_id)).start()
+            threading.Thread(target=handle_message,
+                             args=(text, peer_id, from_id, message.get('conversation_message_id'),
+                                   message.get('date'))).start()
             
         return 'ok'
 
