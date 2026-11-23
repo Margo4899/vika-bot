@@ -330,20 +330,33 @@ INVISIBLE = "\u2060"
 def hide_triggers(text):
     return TRIGGER_WORDS.sub(lambda m: INVISIBLE.join(m.group(0)), text or "")
 
-def send_message(peer_id, text, attachment=None):
+def send_message(peer_id, text, attachment=None, reply_to_cmid=None):
+    """reply_to_cmid: ответить именно на это сообщение (в ВК оно будет процитировано)."""
     text = hide_triggers(text)
     if vk:
+        params = {
+            'peer_id': peer_id,
+            'message': text,
+            'random_id': random.randint(1, 2**31 - 1)
+        }
+        if attachment:
+            params['attachment'] = attachment
+        if reply_to_cmid:
+            params['forward'] = json.dumps({"peer_id": peer_id, "conversation_message_ids": [reply_to_cmid],
+                                            "is_reply": True})
         try:
-            params = {
-                'peer_id': peer_id,
-                'message': text,
-                'random_id': random.randint(1, 2**31 - 1)
-            }
-            if attachment:
-                params['attachment'] = attachment
             vk.method('messages.send', params)
             print(f"✉️ [ВК] Сообщение успешно отправлено в peer_id={peer_id}")
         except Exception as e:
+            if reply_to_cmid:
+                print(f"⚠️ [ВК] Не вышло ответить на сообщение ({e}), отправляем просто так")
+                params.pop('forward', None)
+                params['random_id'] = random.randint(1, 2**31 - 1)
+                try:
+                    vk.method('messages.send', params)
+                    return
+                except Exception as e2:
+                    e = e2
             print(f"❌ [ВК] Ошибка отправки VK API: {e}")
 
 screen_names_cache = {}
@@ -699,13 +712,13 @@ def handle_message(text, peer_id, from_id, cmid=None, date=None, source="ВК"):
     if late > 60:
         print(f"⏰ [{source}] Сообщение опоздало на {late // 60} мин")
     try:
-        process_message_async(text, peer_id, from_id, late)
+        process_message_async(text, peer_id, from_id, late, cmid)
     finally:
         mark_seen(peer_id, cmid)
 
 STALE_COMMAND_SEC = 300  # !топ и !правила старше 5 минут уже не отвечаем, чтобы не было "топа из ниоткуда"
 
-def process_message_async(text, peer_id, from_id, late=0):
+def process_message_async(text, peer_id, from_id, late=0, cmid=None):
     print(f"\n📩 [НОВОЕ СООБЩЕНИЕ] peer_id={peer_id}, from_id={from_id}, текст: '{text}'")
     if from_id < 0 and -from_id == own_group_id():
         return
@@ -771,7 +784,7 @@ def process_message_async(text, peer_id, from_id, late=0):
         nr = next_rank(user_count)
         if nr and nr[0] - user_count <= 3:
             lines.append(f"🎯 До звания «{nr[2]}» осталось {nr[0] - user_count}")
-    send_message(peer_id, "\n".join(lines))
+    send_message(peer_id, "\n".join(lines), reply_to_cmid=cmid)
     check_legend(peer_id, from_id, user_count)
 
 
