@@ -425,8 +425,8 @@ SYSTEM_INSTRUCTION = (
     "унижения, агрессивный крик) и отвечаешь на них.\n"
     "Хамство, нахальство, наглость, грубость, дерзость, борзота (хам, нахал, нахамил, обнаглел, не борзей, хабалка) — "
     "тоже наезд, сила 1.\n"
-    "НЕ наезд: когда человек ругает сам себя (я дура, ну я и тормоз, какая я тупая) — на себя наехать нельзя; "
-    "дружеские шутки без грубости, приветствия, спокойные споры, жалобы на игру, "
+    "Если человек по-настоящему ругает сам себя (я дура, какая я тупая), это тоже наезд, на кого: 'самого себя'.\n"
+    "НЕ наезд: дружеские шутки без грубости, приветствия, спокойные споры, жалобы на игру, "
     "грубое слово не про человека (\"блин, опять лагает\"), просто упоминание имени.\n"
     "Тебе дают несколько последних сообщений беседы для понимания, кто кому отвечает. "
     "Оценивай только ПОСЛЕДНЕЕ сообщение.\n\n"
@@ -755,7 +755,7 @@ def is_self_target(target_name, from_id):
     if not target_name or target_name == "участников чата":
         return False
     t = target_name.lower().strip()
-    if t in ("себя", "самого себя", "саму себя", "сам себя", "сама себя", "автора", "себе"):
+    if t in ("себя", "саму себя", "сам себя", "сама себя", "автора", "себе"):
         return True
     first = (get_user_name(from_id) or "").split()[0].lower() if from_id else ""
     # имя в любом падеже: Данил / Данила / Даниле, Маша / Машу
@@ -800,22 +800,24 @@ def process_message_async(text, peer_id, from_id, late=0, cmid=None):
 
     # Сам на себя наехать нельзя: "я дура", "ну я и тормоз", или нейросеть указала на автора
     self_talk = is_self_talk(text)
-    if is_toxic and is_self_target(target_name, from_id):
+    if is_toxic and self_talk:
+        # человек по-настоящему ругает сам себя: это тоже считается
+        target_name = "самого себя"
+    elif is_toxic and is_self_target(target_name, from_id):
         # нейросеть перепутала и написала автора как жертву: ищем, кому он на самом деле отвечал
         victim = last_other_speaker(peer_id, from_id)
         print(f"🔧 [Анализ] Нейросеть указала на автора ({target_name}), меняю на: {victim or 'всю беседу'}")
         target_name = victim if victim and not is_self_target(victim, from_id) else "участников чата"
-    if self_talk:
-        print("🙃 [Анализ] Человек ругает сам себя, не считаем")
-        is_toxic = False
 
     # мат, оскорбления, хамство и нахальство засчитываются всегда, даже если нейросеть решила иначе
-    if level in ("strong", "mild") and not is_toxic and not self_talk:
+    if level in ("strong", "mild") and not is_toxic:
         print("🔥 [Анализ] Явная грубость: засчитываем, хотя нейросеть сказала 'не токсик'")
         is_toxic = True
         ai_comment = ai_comment or random.choice(FALLBACK_COMMENTS)
         power = 2 if level == "strong" else 1
 
+    if is_toxic and self_talk:
+        target_name = "самого себя"
     print(f"📊 [Итог анализа] is_toxic={is_toxic}, target_name='{target_name}'")
     if not is_toxic:
         return
