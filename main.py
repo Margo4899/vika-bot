@@ -487,7 +487,9 @@ def build_user_prompt(peer_id, from_id, text):
     ctx = ("Предыдущие сообщения беседы:\n" + "\n".join(lines) + "\n\n") if lines else ""
     author = get_user_name(from_id).split()[0]
     return (f"{ctx}ПОСЛЕДНЕЕ сообщение (его и оцени), автор {author}: '{text}'\n"
-            f"Если отвечаешь, обращайся только к {author}, а не к другим людям из переписки.")
+            f"Если отвечаешь, обращайся только к {author}, а не к другим людям из переписки. "
+            f"{author} — автор наезда, поэтому в поле «на кого» его не пиши: укажи того, кому он ответил "
+            f"(по переписке) или 'участников чата'.")
 
 def ask_gemini(text):
     for model_name in GEMINI_MODELS:
@@ -729,6 +731,25 @@ def is_self_talk(text):
         return False
     return bool(SELF_WORDS.search(t)) and not OTHER_WORDS.search(t)
 
+ACCUSATIVE_ENDINGS = (("ья", "ью"), ("ия", "ию"), ("а", "у"), ("я", "ю"))
+
+def to_accusative(name):
+    """Маша -> Машу, Илья -> Илью, Данил -> Данила (просто для строки «наезд на ...»)."""
+    for end, acc in ACCUSATIVE_ENDINGS:
+        if name.lower().endswith(end):
+            return name[:-len(end)] + acc
+    if name[-1:].lower() in "бвгджзклмнпрстфхцчшщ":
+        return name + "а"
+    return name
+
+def last_other_speaker(peer_id, from_id):
+    """Имя (в винительном) того, кто писал в беседе последним до автора."""
+    for u, _t in reversed(list(CHAT_HISTORY.get(peer_id, []))[:-1]):
+        if u != from_id and u > 0:
+            first = (get_user_name(u) or "").split()
+            return to_accusative(first[0]) if first else None
+    return None
+
 def is_self_target(target_name, from_id):
     """Нейросеть написала, что наехали на самого автора."""
     if not target_name or target_name == "участников чата":
@@ -780,14 +801,16 @@ def process_message_async(text, peer_id, from_id, late=0, cmid=None):
     # Сам на себя наехать нельзя: "я дура", "ну я и тормоз", или нейросеть указала на автора
     self_talk = is_self_talk(text)
     if is_toxic and is_self_target(target_name, from_id):
-        print(f"🙃 [Анализ] Наезд на самого себя ({target_name}), не считаем")
-        is_toxic = False
+        # нейросеть перепутала и написала автора как жертву: ищем, кому он на самом деле отвечал
+        victim = last_other_speaker(peer_id, from_id)
+        print(f"🔧 [Анализ] Нейросеть указала на автора ({target_name}), меняю на: {victim or 'всю беседу'}")
+        target_name = victim if victim and not is_self_target(victim, from_id) else "участников чата"
     if self_talk:
         print("🙃 [Анализ] Человек ругает сам себя, не считаем")
         is_toxic = False
 
     # мат, оскорбления, хамство и нахальство засчитываются всегда, даже если нейросеть решила иначе
-    if level in ("strong", "mild") and not is_toxic and not self_talk and not is_self_target(target_name, from_id):
+    if level in ("strong", "mild") and not is_toxic and not self_talk:
         print("🔥 [Анализ] Явная грубость: засчитываем, хотя нейросеть сказала 'не токсик'")
         is_toxic = True
         ai_comment = ai_comment or random.choice(FALLBACK_COMMENTS)
