@@ -3,3 +3,4 @@ vk_api
 requests
 gunicorn
 psycopg2-binary
+Pillow

@@ -1,6 +1,7 @@
 import os
 import re
 import json
+import datetime
 import random
 import requests
 import threading
@@ -133,7 +134,7 @@ def init_db_structure():
 # Запускаем проверку структуры БД при загрузке скрипта
 init_db_structure()
 
-def add_toxicity_point(peer_id, user_id):
+def add_toxicity_point(peer_id, user_id, points=1):
     """Гарантированное добавление +1 балла с полным логированием каждого шага"""
     print(f"\n==================== [БД ОБНОВЛЕНИЕ] ====================")
     print(f"👉 Запрос на плюс балл: peer_id={peer_id} (тип: {type(peer_id)}), user_id={user_id} (тип: {type(user_id)})")
@@ -150,11 +151,11 @@ def add_toxicity_point(peer_id, user_id):
             
             sql_upsert = """
                 INSERT INTO toxicity_stats (peer_id, user_id, score)
-                VALUES (%s, %s, 1)
+                VALUES (%s, %s, %s)
                 ON CONFLICT (peer_id, user_id)
-                DO UPDATE SET score = toxicity_stats.score + 1;
+                DO UPDATE SET score = toxicity_stats.score + EXCLUDED.score;
             """
-            cur.execute(sql_upsert, (peer_id, user_id))
+            cur.execute(sql_upsert, (peer_id, user_id, points))
             print(f"   Успешно выполнено cur.execute()! Затронуто строк: {cur.rowcount}")
 
             print("⏳ [БД] Выполняем commit()...")
@@ -609,7 +610,7 @@ TOP_ANNOUNCE = ("🎁 Кто первым в беседе наберет 500 б�
 def rules_text(peer_id):
     ranks = "\n".join(f"{emoji} {title} — от {score}" for score, emoji, title in RANKS[:-1])
     legend = get_awards(peer_id).get(LEGEND_AWARD)
-    prize = ("💎 Легенда хамства в этой беседе уже есть, но топ продолжается!"
+    prize = ("💎 Легенда хамства в этой беседе уже есть, но топ продолжается!\n\n" + PRIVILEGES_TEXT
              if legend else
              f"🎁 Кто первым в беседе наберет {LEGEND_SCORE} баллов, получит СЕКРЕТНЫЙ приз, еще грандиознее медали хамства!")
     return (
@@ -670,18 +671,262 @@ def award_top1(peer_id):
         f"получит награду еще грандиознее. Пишите !топ, чтобы следить за гонкой.",
         attachment=photo)
 
+# ================= ЛЕГЕНДА ХАМСТВА: секретный приз за 500 =================
+from legend_avatar import make_legend_card
+
+MONTHS = ["января", "февраля", "марта", "апреля", "мая", "июня", "июля", "августа",
+          "сентября", "октября", "ноября", "декабря"]
+
+def ai_text(system, user, max_tokens=700):
+    """Свободный текст от нейросети (Gemini, потом Groq). None, если никто не ответил."""
+    if GEMINI_API_KEY:
+        for model_name in GEMINI_MODELS:
+            try:
+                r = requests.post(
+                    f"https://generativelanguage.googleapis.com/v1beta/models/{model_name}:generateContent",
+                    headers={"x-goog-api-key": GEMINI_API_KEY},
+                    json={"systemInstruction": {"parts": [{"text": system}]},
+                          "contents": [{"role": "user", "parts": [{"text": user}]}],
+                          "generationConfig": {"temperature": 1.0, "maxOutputTokens": max_tokens}},
+                    timeout=30)
+                if r.status_code != 200:
+                    continue
+                parts = (r.json().get("candidates") or [{}])[0].get("content", {}).get("parts", [])
+                text = "".join(p.get("text", "") for p in parts if not p.get("thought")).strip()
+                if text:
+                    return text
+            except Exception as e:
+                print(f"⚠️ [GEMINI текст] {model_name}: {e}")
+    key = (AI_API_KEY or "").strip()
+    if key:
+        for model_name in AI_MODELS:
+            try:
+                r = requests.post("https://api.groq.com/openai/v1/chat/completions",
+                                  headers={"Authorization": f"Bearer {key}"},
+                                  json={"model": model_name, "temperature": 1.0, "max_tokens": max_tokens,
+                                        "messages": [{"role": "system", "content": system},
+                                                     {"role": "user", "content": user}]},
+                                  timeout=30)
+                if r.status_code == 200:
+                    text = r.json()["choices"][0]["message"]["content"].strip()
+                    text = re.sub(r"<think>.*?</think>", "", text, flags=re.S).strip()
+                    if text:
+                        return text
+            except Exception as e:
+                print(f"⚠️ [GROQ текст] {model_name}: {e}")
+    return None
+
+def get_user_info(user_id):
+    """(имя фамилия, ник, пол 'm'/'f'/None, ссылка на большую аватарку)."""
+    try:
+        res = vk.method('users.get', {'user_ids': user_id, 'fields': 'screen_name,sex,photo_max_orig,photo_400_orig'})[0]
+        name = f"{res.get('first_name', '')} {res.get('last_name', '')}".strip()
+        sex = {1: "f", 2: "m"}.get(res.get("sex"))
+        photo = res.get("photo_max_orig") or res.get("photo_400_orig")
+        if photo and "camera_" in photo:   # заглушка ВК вместо фото
+            photo = None
+        return name, res.get('screen_name') or f"id{user_id}", sex, photo
+    except Exception as e:
+        print(f"⚠️ [ВК] Не удалось получить профиль {user_id}: {e}")
+        return get_user_name(user_id), f"id{user_id}", None, None
+
+def legend_card_photo(peer_id, user_id, score):
+    """Аватарка из ВК с короной -> вложение для сообщения."""
+    name, _nick, _sex, photo_url = get_user_info(user_id)
+    avatar = None
+    if photo_url:
+        try:
+            avatar = requests.get(photo_url, timeout=20).content
+        except Exception as e:
+            print(f"⚠️ [ЛЕГЕНДА] Не скачалась аватарка: {e}")
+    now = datetime.datetime.now()
+    path = f"/tmp/legend_{peer_id}_{user_id}.png"
+    try:
+        with open(path, "wb") as f:
+            f.write(make_legend_card(avatar, name, score, f"{now.day} {MONTHS[now.month - 1]} {now.year}"))
+        return upload_photo(peer_id, path)
+    except Exception as e:
+        print(f"⚠️ [ЛЕГЕНДА] Открытка не получилась: {e}")
+        return upload_photo(peer_id, os.path.join(ASSETS, "legend_500.png"))
+
+def legend_poem(user_id):
+    name, nick, sex, _ = get_user_info(user_id)
+    first = name.split()[0] if name else "легенда"
+    gender = {"m": "парень", "f": "девушка"}.get(sex, "пол неизвестен, пиши без рода")
+    poem = ai_text(
+        "Ты Хамулька, дерзкая дворовая девчонка и хозяйка банка хамства в беседе по игре аватария. "
+        "Пиши по-русски, весело и дерзко, БЕЗ мата, без угроз и без оскорблений внешности и семьи.",
+        f"Напиши торжественный хамский стих в рифму, 8 строк, в честь легенды хамства: {first} ({gender}), "
+        f"ник во вконтакте @{nick}. Обязательно упомяни ник @{nick} и имя. Смысл: этот человек набрал 500 баллов "
+        f"хамства, язык острее перца, вся беседа трепещет, а Хамулька снимает кепку. Ровная рифма и ритм. "
+        f"Только сам стих, без заголовка и пояснений.", 600)
+    if not poem:
+        poem = (f"Кто тут острый на язык, кто хамит без передышки?\n"
+                f"Это {first}, наш @{nick}, у беседы все вспышки!\n"
+                f"Пятьсот раз язык без тормоза летел по чату,\n"
+                f"Хамулька кепку сняла, легенде отдала зарплату!")
+    return poem.strip()
+
+PRIVILEGES_TEXT = (
+    "🎁 Привилегии легенды:\n"
+    "⚖️ !приговор @кто-то — раз в день Хамулька выносит этому человеку дерзкий приговор от имени легенды\n"
+    "📜 !указ текст — раз в день торжественный указ легенды на всю беседу\n"
+    "⚔️ !дуэль @кто-то — дуэль хамства: у обоих одна попытка, Хамулька судит, победителю +5 баллов (3 раза в день)"
+)
+
 def check_legend(peer_id, user_id, score):
     """Секретный приз первому, кто наберет 500 баллов в беседе."""
-    if score < LEGEND_SCORE or not claim_award(peer_id, LEGEND_AWARD, user_id):
+    if score < LEGEND_SCORE or user_id < 0 or not claim_award(peer_id, LEGEND_AWARD, user_id):
         return
     print(f"💎 [НАГРАДА] Легенда хамства в беседе {peer_id}: {user_id} ({score})")
-    photo = upload_photo(peer_id, os.path.join(ASSETS, "legend_500.png"))
+    _name, _nick, sex, _ = get_user_info(user_id)
+    got = {"m": "набрал", "f": "набрала"}.get(sex, "набрал(а)")
+    photo = legend_card_photo(peer_id, user_id, score)
     send_message(peer_id,
         f"💎💎💎 СЕКРЕТНЫЙ ПРИЗ РАСКРЫТ! 💎💎💎\n\n"
-        f"{at_mention(user_id)} первым в беседе набрал(а) {score} баллов и становится ЛЕГЕНДОЙ ХАМСТВА!\n\n"
-        f"👑 Отныне в топе рядом с именем сияет 💎, и это навсегда.\n"
-        f"🌶️ Хамулька снимает кепку и официально признает: острее языка в этом дворе нет.",
+        f"{at_mention(user_id)} первым в беседе {got} {score} баллов и становится ЛЕГЕНДОЙ ХАМСТВА!\n\n"
+        f"👑 Вот твой портрет с короной хамства, повесь в рамочку.\n"
+        f"💎 В топе рядом с именем теперь навсегда сияет 💎.\n\n"
+        f"{PRIVILEGES_TEXT}",
         attachment=photo)
+    time.sleep(2)
+    send_message(peer_id, "🎤 Хамулька зачитывает оду легенде:\n\n" + legend_poem(user_id))
+
+def is_legend(peer_id, user_id):
+    return get_awards(peer_id).get(LEGEND_AWARD) == user_id
+
+def target_from_command(text, reply_to, from_id):
+    m = re.search(r"\[(id|club|public)(\d+)\|[^\]]*\]", text or "")
+    if m:
+        uid = int(m.group(2)) * (1 if m.group(1) == "id" else -1)
+        if uid != from_id:
+            return uid
+    if reply_to and reply_to != from_id:
+        return reply_to
+    return None
+
+def today_key():
+    return datetime.datetime.now().strftime("%Y%m%d")
+
+def legend_command(text, peer_id, from_id, reply_to=None):
+    """!приговор, !указ, !дуэль. True, если сообщение было командой легенды."""
+    low = (text or "").lower().strip()
+    cmd = next((c for c in ("!приговор", "!указ", "!дуэль") if low.startswith(c)), None)
+    if not cmd:
+        return False
+    if not is_legend(peer_id, from_id):
+        send_message(peer_id, f"🙅 {mention(from_id)}, это привилегия ЛЕГЕНДЫ ХАМСТВА 💎. Сначала набери {LEGEND_SCORE} баллов, а потом командуй.")
+        return True
+
+    if cmd == "!указ":
+        decree = text.strip()[len("!указ"):].strip(" :")
+        decree = re.sub(r"@(all|online|все|здесь)", "", decree, flags=re.I).strip()
+        if not decree:
+            send_message(peer_id, "📜 Напиши текст указа: !указ всем пить чай и не ныть")
+            return True
+        if not claim_award(peer_id, f"decree_{today_key()}", from_id):
+            send_message(peer_id, "📜 Сегодня указ уже был. Новый указ можно издать завтра.")
+            return True
+        send_message(peer_id,
+            f"📜📜 УКАЗ ЛЕГЕНДЫ ХАМСТВА 📜📜\n\n«{decree[:400]}»\n\n"
+            f"Подписано: 💎 {mention(from_id)}\nПечать Хамульки 🌶️ Исполнять немедленно, кто не согласен — сам виноват.")
+        return True
+
+    target = target_from_command(text, reply_to, from_id)
+    if not target:
+        send_message(peer_id, f"Кого? Отметь человека: {cmd} @ник (или ответь командой на его сообщение).")
+        return True
+
+    if cmd == "!приговор":
+        if not claim_award(peer_id, f"verdict_{today_key()}", from_id):
+            send_message(peer_id, "⚖️ Суд сегодня уже заседал. Следующий приговор — завтра.")
+            return True
+        tname = get_user_name(target).split()[0]
+        verdict = ai_text(
+            "Ты Хамулька, дерзкая дворовая судья банка хамства в беседе по игре аватария. "
+            "Без мата, без угроз, без оскорблений внешности и семьи. Смешно и дерзко.",
+            f"Вынеси шуточный приговор участнику {tname} по просьбе легенды хамства. "
+            f"Формат: 'Обвиняется в: ...' (смешное выдуманное преступление в чате или в игре) и "
+            f"'Приговор: ...' (смешное наказание в аватарии или в беседе). Всего 2-3 коротких предложения.", 300)
+        verdict = verdict or "Обвиняется в: слишком скучных сообщениях. Приговор: неделю ставить реакции на всё подряд."
+        send_message(peer_id,
+            f"⚖️ ПРИГОВОР ЛЕГЕНДЫ ХАМСТВА ⚖️\nПо требованию 💎 {mention(from_id)}\n"
+            f"Подсудимый: {mention(target)}\n\n{verdict}\n\n🔨 Приговор окончательный и обжалованию не подлежит.")
+        return True
+
+    if cmd == "!дуэль":
+        if target < 0:
+            send_message(peer_id, "⚔️ С ботами не дуэлимся, они не умеют проигрывать красиво.")
+            return True
+        if peer_id in DUELS:
+            send_message(peer_id, "⚔️ Дуэль уже идет, дождитесь конца!")
+            return True
+        n = sum(1 for i in range(1, 4) if get_awards(peer_id).get(f"duel{i}_{today_key()}"))
+        if n >= 3 or not claim_award(peer_id, f"duel{n + 1}_{today_key()}", from_id):
+            send_message(peer_id, "⚔️ На сегодня дуэлей хватит (3 в день). Приходи завтра.")
+            return True
+        DUELS[peer_id] = {"a": from_id, "b": target, "burns": {}, "until": time.time() + DUEL_SECONDS}
+        send_message(peer_id,
+            f"⚔️⚔️ ДУЭЛЬ ХАМСТВА! ⚔️⚔️\n\n💎 {mention(from_id)} вызывает {at_mention(target)}!\n\n"
+            f"У каждого {DUEL_SECONDS // 60} минуты и ОДНА попытка: ваше следующее сообщение в беседе — ваш выпад. "
+            f"Хамулька будет судить. Победителю +{DUEL_PRIZE} баллов 🌶️")
+        threading.Thread(target=finish_duel_later, args=(peer_id,), daemon=True).start()
+        return True
+    return False
+
+# --- Дуэль ---
+DUELS = {}
+DUEL_SECONDS = 180
+DUEL_PRIZE = 5
+_duel_lock = threading.Lock()
+
+def duel_capture(text, peer_id, from_id):
+    """Если идет дуэль и пишет дуэлянт — это его выпад. True, если сообщение забрали в дуэль."""
+    with _duel_lock:
+        d = DUELS.get(peer_id)
+        if not d or from_id not in (d["a"], d["b"]) or from_id in d["burns"] or text.lower().startswith("!"):
+            return False
+        d["burns"][from_id] = text[:400]
+        both = len(d["burns"]) == 2
+    print(f"⚔️ [ДУЭЛЬ] выпад от {from_id}")
+    if both:
+        threading.Thread(target=finish_duel, args=(peer_id,), daemon=True).start()
+    return True
+
+def finish_duel_later(peer_id):
+    time.sleep(DUEL_SECONDS + 2)
+    finish_duel(peer_id)
+
+def finish_duel(peer_id):
+    with _duel_lock:
+        d = DUELS.pop(peer_id, None)
+    if not d:
+        return
+    a, b, burns = d["a"], d["b"], d["burns"]
+    if not burns:
+        send_message(peer_id, f"⚔️ Дуэль окончена: {mention(a)} и {mention(b)} оба промолчали. Скукота, все свободны 🥱")
+        return
+    if len(burns) == 1:
+        winner = next(iter(burns))
+        loser = b if winner == a else a
+        verdict = f"{mention(loser)} струсил(а) и промолчал(а). Победа без боя!"
+    else:
+        na, nb = get_user_name(a).split()[0], get_user_name(b).split()[0]
+        answer = ai_text(
+            "Ты Хамулька, судья дуэлей хамства. Оцениваешь, чей выпад острее, смешнее и находчивее. "
+            "Без мата. Отвечай строго в формате: ПОБЕДИТЕЛЬ: 1 или 2 | одна дерзкая фраза-вердикт.",
+            f"Выпад 1 ({na}): «{burns[a]}»\nВыпад 2 ({nb}): «{burns[b]}»", 200) or ""
+        m = re.search(r"ПОБЕДИТЕЛЬ\s*:\s*([12])\s*\|?\s*(.*)", answer, flags=re.S | re.I)
+        if m:
+            winner = a if m.group(1) == "1" else b
+            verdict = m.group(2).strip() or "Вот это было остро!"
+        else:
+            winner = random.choice([a, b])
+            verdict = "Оба хороши, но шар судьбы решил так."
+    score = add_toxicity_point(peer_id, winner, DUEL_PRIZE)
+    send_message(peer_id,
+        f"🏆 ИТОГ ДУЭЛИ ХАМСТВА\n\n{verdict}\n\n"
+        f"Победа за {mention(winner)}! +{DUEL_PRIZE} баллов 🌶️ (теперь {score})")
 
 _own_group_id = {"id": None}
 
@@ -802,6 +1047,12 @@ def process_message_async(text, peer_id, from_id, late=0, cmid=None, reply_to=No
         return
     if late > STALE_COMMAND_SEC and text.strip().lower().startswith(("!", "/")):
         print("⏰ Старая команда, пропускаем")
+        return
+
+    # Дуэль и привилегии легенды
+    if duel_capture(text, peer_id, from_id):
+        return
+    if legend_command(text, peer_id, from_id, reply_to):
         return
 
     # Правила
@@ -932,7 +1183,7 @@ def catch_up():
         except Exception as e:
             print(f"⚠️ [ДОГОНЯЕМ] Не удалось прочитать беседу {pid}: {e}")
             continue
-        items = sorted(res.get('items', []), key=lambda m: m.get('conversation_message_id', 0))
+        items = sorted((res.get('items', []) if isinstance(res, dict) else []), key=lambda m: m.get('conversation_message_id', 0))
         print(f"🔁 [ДОГОНЯЕМ] Беседа {pid}: доступ к сообщениям есть, найдено {len(items)}")
         if probe:
             continue
