@@ -433,7 +433,8 @@ SYSTEM_INSTRUCTION = (
     "Если последнее сообщение — наезд, ответь строго одной строкой:\n"
     "ТОКСИК | сила 1-3 | на кого | комментарий\n"
     "сила: 1 легкий подкол, 2 грубо, 3 мат или жесткое оскорбление.\n"
-    "на кого: имя того, на кого наехали, в винительном падеже (на Машу, на Олега); "
+    "на кого: сначала смотри, к кому обращаются в самом сообщении (имя в начале фразы, отметка, бот вроде ГигаЧата); "
+    "имя того, на кого наехали, в винительном падеже (на Машу, на Олега); "
     "если на всех или непонятно — 'участников чата'.\n"
     "комментарий: одно-два предложения, до 30 слов, сначала 1-2 эмодзи. Отвечай автору наезда так же дерзко "
     "и по-хамски, в тему его сообщения: подхвати его слова и переверни их против него, "
@@ -699,7 +700,7 @@ def own_group_id():
 _seen_lock = threading.Lock()
 _handled = set()   # (peer_id, cmid) уже обработанные, чтобы повтор от ВК не считался дважды
 
-def handle_message(text, peer_id, from_id, cmid=None, date=None, source="ВК"):
+def handle_message(text, peer_id, from_id, cmid=None, date=None, source="ВК", reply_to=None):
     """Общий вход: и для сообщений от ВК, и для догоняющих после сна."""
     if cmid:
         with _seen_lock:
@@ -715,7 +716,7 @@ def handle_message(text, peer_id, from_id, cmid=None, date=None, source="ВК"):
     if late > 60:
         print(f"⏰ [{source}] Сообщение опоздало на {late // 60} мин")
     try:
-        process_message_async(text, peer_id, from_id, late, cmid)
+        process_message_async(text, peer_id, from_id, late, cmid, reply_to)
     finally:
         mark_seen(peer_id, cmid)
 
@@ -742,6 +743,40 @@ def to_accusative(name):
         return name + "а"
     return name
 
+# Известные боты беседы: как их зовут в сообщениях -> как писать в «наезд на ...»
+KNOWN_ADDRESSEES = {
+    "гига": "ГигаЧат", "гигачат": "ГигаЧат", "гигачата": "ГигаЧат", "giga": "ГигаЧат", "gigachat": "ГигаЧат",
+    "кунегунда": "Кунегунду", "кунигунда": "Кунегунду", "куня": "Кунегунду",
+    "хамулька": "Хамульку", "викулька": "Хамульку",
+}
+# Слова в начале фразы с запятой, которые НЕ обращение к человеку
+NOT_ADDRESS = set("""блин короче слушай слушайте ну эй так ладно бля блять капец жесть кстати вообще ой ох ах
+ахах ахаха хах хаха лол да нет ага угу ок окей типа вот итак пипец ппц господи боже мда хм хмм""".split())
+
+def addressee_from_text(text, from_id, reply_to=None):
+    """Кому адресован наезд, по самому сообщению: ответ на сообщение, отметка @, обращение «Имя, ...»."""
+    if reply_to and reply_to != from_id:
+        if reply_to < 0:
+            return get_user_name(reply_to)
+        first = (get_user_name(reply_to) or "").split()
+        if first:
+            return to_accusative(first[0])
+    m = re.search(r"\[(id|club|public)(\d+)\|([^\]]+)\]", text or "")
+    if m:
+        uid = int(m.group(2)) * (1 if m.group(1) == "id" else -1)
+        if uid != from_id:
+            label = m.group(3).lstrip("@").strip()
+            return to_accusative(label.split()[0]) if uid > 0 and label else label
+    low = (text or "").lower()
+    for alias, shown in KNOWN_ADDRESSEES.items():
+        if re.search(rf"(?<![а-яёa-z]){alias}(?![а-яёa-z])", low):
+            return shown
+    m = re.match(r"\s*([А-ЯЁA-Zа-яёa-z]{2,15})\s*,", text or "")
+    if m and m.group(1).lower() not in NOT_ADDRESS:
+        name = m.group(1)
+        return to_accusative(name[:1].upper() + name[1:])
+    return None
+
 def last_other_speaker(peer_id, from_id):
     """Имя (в винительном) того, кто писал в беседе последним до автора."""
     for u, _t in reversed(list(CHAT_HISTORY.get(peer_id, []))[:-1]):
@@ -761,7 +796,7 @@ def is_self_target(target_name, from_id):
     # имя в любом падеже: Данил / Данила / Даниле, Маша / Машу
     return len(first) >= 3 and t.split()[0][:max(3, len(first) - 1)] == first[:max(3, len(first) - 1)]
 
-def process_message_async(text, peer_id, from_id, late=0, cmid=None):
+def process_message_async(text, peer_id, from_id, late=0, cmid=None, reply_to=None):
     print(f"\n📩 [НОВОЕ СООБЩЕНИЕ] peer_id={peer_id}, from_id={from_id}, текст: '{text}'")
     if from_id < 0 and -from_id == own_group_id():
         return
@@ -800,7 +835,12 @@ def process_message_async(text, peer_id, from_id, late=0, cmid=None):
 
     # Сам на себя наехать нельзя: "я дура", "ну я и тормоз", или нейросеть указала на автора
     self_talk = is_self_talk(text)
-    if is_toxic and self_talk:
+    addressee = None if self_talk else addressee_from_text(text, from_id, reply_to)
+    if is_toxic and addressee:
+        if addressee != target_name:
+            print(f"🎯 [Анализ] По сообщению наезд на: {addressee} (нейросеть сказала: {target_name})")
+        target_name = addressee
+    elif is_toxic and self_talk:
         # человек по-настоящему ругает сам себя: это тоже считается
         target_name = "самого себя"
     elif is_toxic and is_self_target(target_name, from_id):
@@ -818,6 +858,8 @@ def process_message_async(text, peer_id, from_id, late=0, cmid=None):
 
     if is_toxic and self_talk:
         target_name = "самого себя"
+    elif is_toxic and addressee:
+        target_name = addressee
     print(f"📊 [Итог анализа] is_toxic={is_toxic}, target_name='{target_name}'")
     if not is_toxic:
         return
@@ -902,7 +944,8 @@ def catch_up():
             print(f"🔁 [ДОГОНЯЕМ] Беседа {pid}: пропущено сообщений: {len(missed)}")
         for m in missed:
             handle_message(m.get('text', ''), pid, m.get('from_id'), m.get('conversation_message_id'),
-                           m.get('date'), source="ДОГОНЯЕМ")
+                           m.get('date'), source="ДОГОНЯЕМ",
+                           reply_to=(m.get('reply_message') or {}).get('from_id'))
 
 if vk:
     threading.Thread(target=catch_up, daemon=True).start()
@@ -937,7 +980,8 @@ def bot():
         if peer_id and from_id:
             threading.Thread(target=handle_message,
                              args=(text, peer_id, from_id, message.get('conversation_message_id'),
-                                   message.get('date'))).start()
+                                   message.get('date'), "ВК",
+                                   (message.get('reply_message') or {}).get('from_id'))).start()
             
         return 'ok'
 
